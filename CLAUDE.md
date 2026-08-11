@@ -58,7 +58,10 @@ Bu şema projenin omurgası. Değiştirilecekse tüm modüller birlikte güncell
 - `ear` → `woke` : uyandırma kelimesi duyuldu, mouth onay çalsın
 - `mouth` → `speaking` : hoparlör aktif, ear sussun
 - `mouth` → `ready` : onay cümlesi bitti, ear kayda başlayabilir
-- `mouth` → `done` : kuyruk boşaldı
+- `mouth` → `done` : kuyruk `mouth.reply_gap_sec` boyunca boş kaldı (anlık
+  boşluk yetmez - brain cümle cümle yayınlarken sıradaki cümle gecikebilir,
+  erken "done" ear'ın mouth'un kendi sesini dinleyip geri besleme döngüsüne
+  girmesine yol açar)
 
 Henüz yazılmayan, tasarımı belli olan konular:
 - `yaver/skill/request` : brain → skills, `{"name": "...", "params": {...}}`
@@ -149,19 +152,41 @@ python find_microphone.py       # cihazları listele
   farktan sonra tamamen geçersiz kalıyor ve tüm bağlam sıfırdan işleniyor —
   yaşanmış ve tekrar tekrar hata ayıklanmış bir performans/doğruluk sorunu.
 
+## Uyandırma modu: openWakeWord yerine metin-içi tetik kelime
+
+`config.yaml`'da `wakeword.enabled: false` (şimdilik varsayılan). Bu modda
+openWakeWord hiç çalışmaz; `ear.py` her algılanan konuşmayı (rms eşiği ile)
+sürekli Whisper'a verir, çıkan metinde `wakeword.trigger_word` (varsayılan
+"yaver") cümlenin herhangi bir yerinde geçiyorsa (`contains_trigger()`)
+brain'e yayınlar, geçmiyorsa sessizce atar. Böylece "Yaver, bugün hava nasıl"
+gibi tek nefeste, doğal cümleler çalışır — ayrı "uyandır → onay bekle → komutu
+söyle" iki aşaması yok. Bedeli: odadaki her konuşma parçası Whisper'dan geçer
+(GPU'da ucuz ama sürekli çalışır).
+
+`wakeword.enabled: true` yaparsan eski iki-aşamalı akışa (openWakeWord +
+"Efendim" onayı + ayrı kayıt) dönülür — ama bunun için `hey_jarvis` yerine
+gerçek bir "Yaver" ses modeli eğitilmesi gerekir (aşağıdaki bilinen sorun 2).
+Plan: Pi 5'e taşırken ya da sürekli Whisper yükü sorun olursa, önce ucuz bir
+filtre olarak bu moda dönülür.
+
 ## Şu an çalışan / çalışmayan
 
-**Çalışıyor:** uyandırma (skor ~0.94), Türkçe tanıma (GPU'da, isabetli, ~0.5 sn),
-LLM cevabı (GPU'da, ~45 tok/sn), cümle cümle akışlı seslendirme, onay cümlesi
-("Efendim"), ağız konuşurken kulağın susması, kalıcı konuşma geçmişi.
+**Çalışıyor:** metin-içi tetik kelime ("yaver" cümlede geçince cevap verir),
+Türkçe tanıma (GPU'da, isabetli, ~0.5 sn), LLM cevabı (GPU'da, ~45 tok/sn),
+cümle cümle akışlı seslendirme, ağız konuşurken kulağın susması, kalıcı
+konuşma geçmişi.
 
 **Bilinen sorunlar:**
 
 1. **Sözü kesilemiyor.** Mouth konuşurken ear tamamen sağır. Çözüm: mouth
    konuşurken ear sadece uyandırma kelimesini dinlesin, duyarsa `sd.stop()`.
-2. **Uyandırma kelimesi İngilizce.** "hey jarvis" kullanılıyor. Özel "Yaver"
-   modeli openWakeWord'ün eğitim hattıyla, Piper'ın Türkçe sesiyle sentetik
-   örnek üreterek eğitilebilir.
+2. **Özel "Yaver" uyandırma modeli henüz eğitilmedi.** Şimdilik gerekmiyor
+   (yukarıdaki metin-içi tetik moduyla "Yaver" ismi zaten çalışıyor); sadece
+   `wakeword.enabled: true` moduna dönülmek istenirse gerekir.
+3. **Metin-içi tetik, niyet ayrımı yapmaz.** "Yaver" kelimesi asistana değil
+   üçüncü şahıs olarak söylense bile (örn. birine "Yaver bugün çalışmadı"
+   derken) yine tetiklenir. Hem bu modda hem openWakeWord modunda ortak,
+   çözülmemiş bir sınırlama.
 
 ## Sıradaki işler (öncelik sırasıyla)
 
@@ -171,7 +196,8 @@ LLM cevabı (GPU'da, ~45 tok/sn), cümle cümle akışlı seslendirme, onay cüm
 2. **Hafıza yazma** — "Yaver, adımın Mehmet olduğunu hatırla" → `memory.json`.
    Bunu da bir yetenek olarak yap, beyne gömme.
 3. **Söz kesme** (yukarıdaki 1. sorun).
-4. **Özel "Yaver" uyandırma modeli.**
+4. **Özel "Yaver" uyandırma modeli** — düşük öncelik, gerekmedikçe ertelendi
+   (bkz. yukarıdaki "Uyandırma modu" bölümü).
 5. **Pi 5'e taşıma** — `config.yaml`'da yol/cihaz/model değişiklikleri,
    `whisper.device: cpu`, daha küçük LLM. Kod değişmemeli; değişmesi gerekiyorsa
    o bir tasarım hatasıdır, önce onu düzelt.

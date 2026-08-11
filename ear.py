@@ -37,6 +37,7 @@ if sys.platform == "win32":
 
 import json
 import queue
+import re
 import threading
 import time
 from collections import deque
@@ -188,6 +189,7 @@ def record_speech(threshold, pre_roll=None):
     print("  dinliyorum...", end="", flush=True)
     chunks = list(pre_roll) if pre_roll else []
     silence_blocks = 0
+    resets = 0  # sessizlik sayaci kac kez bir gurultu patlamasiyla sifirlandi (teshis icin)
     block_sec = CONFIG["audio"]["block_size"] / CONFIG["audio"]["sample_rate"]
     required_silence = int(CONFIG["recording"]["silence_sec"] / block_sec)
     max_blocks = int(CONFIG["recording"]["max_sec"] / block_sec)
@@ -197,6 +199,8 @@ def record_speech(threshold, pre_roll=None):
         block = audio_queue.get()
         chunks.append(block)
         if rms(block) > threshold:
+            if speech_started and silence_blocks > 0:
+                resets += 1
             speech_started = True
             silence_blocks = 0
         elif speech_started:
@@ -204,7 +208,7 @@ def record_speech(threshold, pre_roll=None):
             if silence_blocks >= required_silence:
                 break
 
-    print(" bitti.")
+    print(f" bitti.{f' ({resets} kez gurultu sessizligi kesti)' if resets else ''}")
     return np.concatenate(chunks) if chunks else np.array([], dtype=np.int16)
 
 
@@ -221,6 +225,15 @@ def is_junk(text):
     return normalized in JUNK or len(normalized) < 2
 
 
+TRIGGER_PATTERN = re.compile(r"\b" + re.escape(CONFIG["wakeword"]["trigger_word"]), re.IGNORECASE)
+
+
+def contains_trigger(text):
+    """Cumle icinde herhangi bir yerde tetik kelimesi geciyor mu (uyandirma
+    modeli kapaliyken kullanilir - bkz. config.yaml wakeword.enabled)."""
+    return bool(TRIGGER_PATTERN.search(text))
+
+
 def transcribe(whisper, audio):
     duration = len(audio) / CONFIG["audio"]["sample_rate"]
     if duration < CONFIG["recording"]["min_sec"]:
@@ -234,6 +247,10 @@ def transcribe(whisper, audio):
         vad_filter=True,
         condition_on_previous_text=False,
         no_speech_threshold=0.6,
+        # trigger kelimesi ("Yaver") kucuk/nadir bir ozel isim oldugu icin Whisper
+        # bunu siklikla benzer sesli yaygin kelimelere ceviriyordu (Ya var, yavar,
+        # Ya ver). hotwords bu kelimenin taninma olasiligini artirir.
+        hotwords=CONFIG["wakeword"]["trigger_word"].capitalize(),
     )
     text = " ".join(s.text.strip() for s in segments).strip()
     print(f"  ({duration:.1f} sn ses -> {time.time() - t0:.2f} sn cevrim)")
@@ -267,7 +284,8 @@ def main():
         if oww:
             print(f"\nHazir. '{CONFIG['wakeword']['model']}' de.  (Ctrl+C ile cik)\n")
         else:
-            print("\nHazir. Uyandirma kapali - konusmaya basla.  (Ctrl+C ile cik)\n")
+            print(f"\nHazir. Konusmaya basla, cumlende '{CONFIG['wakeword']['trigger_word']}' "
+                  f"gecerse cevap veririm.  (Ctrl+C ile cik)\n")
 
         while True:
             block = audio_queue.get()
@@ -306,11 +324,13 @@ def main():
             pre_buffer.clear()
             text = transcribe(whisper, audio)
 
-            if text:
+            if not text:
+                print("  (bos, atlandi)")
+            elif oww or contains_trigger(text):
                 print(f'  ANLADIM: "{text}"')
                 publish_text(client, text)
             else:
-                print("  (bos, atlandi)")
+                print(f'  (tetik kelime yok, atlandi: "{text}")')
 
             time.sleep(CONFIG["wakeword"]["cooldown_sec"] if oww else 0.3)
             while not audio_queue.empty():

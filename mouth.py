@@ -129,20 +129,28 @@ def worker(voice):
     while True:
         job = speech_queue.get()
         publish_status("speaking")
-        try:
-            if job["type"] == "ack":
-                if ack_audio:
-                    play(*random.choice(ack_audio))
-                publish_status("ready")   # kulak bu sinyali bekliyor
-            else:
-                print(f'  soyluyorum: "{job["content"]}"')
-                speak(voice, job["content"])
-        except Exception as error:
-            print(f"  seslendirme hatasi: {error}")
-            if job["type"] == "ack":
-                publish_status("ready")
-        if speech_queue.empty():
-            publish_status("done")
+        while True:
+            try:
+                if job["type"] == "ack":
+                    if ack_audio:
+                        play(*random.choice(ack_audio))
+                    publish_status("ready")   # kulak bu sinyali bekliyor
+                else:
+                    print(f'  soyluyorum: "{job["content"]}"')
+                    speak(voice, job["content"])
+            except Exception as error:
+                print(f"  seslendirme hatasi: {error}")
+                if job["type"] == "ack":
+                    publish_status("ready")
+            # brain cumle cumle yayinliyor, kuyruk anlik bos olsa bile bir
+            # sonraki cumle hemen ardindan gelebilir - "done" demeden once
+            # kisa bir sure bekle, yoksa ear erken "mouth sustu" sanip
+            # mouth'un kendi sesini dinlemeye baslar (geri besleme dongusu).
+            try:
+                job = speech_queue.get(timeout=MOUTH["reply_gap_sec"])
+            except queue.Empty:
+                break
+        publish_status("done")
 
 
 def main():

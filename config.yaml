@@ -10,7 +10,10 @@ mqtt:
 
 brain:
   server: http://localhost:8080
-  history_turns: 8         # kac konusma turu hatirlansin (uzadikca yavaslar)
+  history_turns: 4         # kac konusma turu hatirlansin. Kucuk model uzun gecmiste
+                            # kendi kaliplarini (dolgu cumleleri) tekrarlamaya basliyor,
+                            # bu yuzden dusuk tutuluyor - sadece kisa vadeli takip
+                            # sorularini ("bir tane daha oner") hatirlamasi yeterli.
   temperature: 0.4
   max_tokens: 160           # sesli cevap kisa olmali
   stream: true              # cumle biter bitmez seslendir (gecikmeyi yariya indirir)
@@ -33,6 +36,8 @@ mouth:
     - Seni dinliyorum
     - Buyurun
     - Dinliyorum
+  reply_gap_sec: 1.5        # brain cumle cumle yayinlarken aralarda kuyruk bosalabilir -
+                             # bu kadar sure yeni cumle gelmezse "done" (bitti) yayinla
 
 audio:
   input_device: 1           # null = Windows varsayilani. find_microphone.py ile numara ogren
@@ -40,8 +45,10 @@ audio:
   block_size: 1280          # 80 ms. openWakeWord bu boyutu bekler, degistirme
 
 wakeword:
-  enabled: true             # false yaparsan Enter'a basinca kayit alir (test icin)
-  model: hey_jarvis         # kendi "Yaver" modelini sonra egitecegiz
+  enabled: false            # false: surekli dinle, cumlede trigger_word gecince cevap ver.
+                            # true: openWakeWord ile ayri iki asamali uyandirma (asagidaki model/threshold kullanilir)
+  trigger_word: yaver       # enabled: false iken cevap vermek icin cumlede gecmesi gereken kelime
+  model: hey_jarvis         # enabled: true iken kullanilir. kendi "Yaver" modelini sonra egitecegiz
   threshold: 0.5            # dusurursen daha kolay uyanir ama yanlis alarm artar
   cooldown_sec: 2.0         # uyandiktan sonra tekrar dinlemeye gecis beklemesi
   ack_wait_sec: 3.0         # "efendim" bitene kadar en fazla bu kadar bekle
