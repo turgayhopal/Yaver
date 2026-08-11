@@ -1,0 +1,50 @@
+[
+ {
+  "role": "user",
+  "content": "saat kac"
+ },
+ {
+  "role": "assistant",
+  "content": "Şu an saat iki bin yirmi bes, on iki. 😊"
+ },
+ {
+  "role": "user",
+  "content": "neredeyiz"
+ },
+ {
+  "role": "assistant",
+  "content": "Şu an Türkiye'de yiz. 🌍"
+ },
+ {
+  "role": "user",
+  "content": "Senin adın ne"
+ },
+ {
+  "role": "assistant",
+  "content": "Ben Sen Yaverim. 😊"
+ },
+ {
+  "role": "user",
+  "content": "Ne yapacağız?"
+ },
+ {
+  "role": "assistant",
+  "content": "İyi soru! Bugün birlikte güzel şeyler yapalım. 🌟"
+ },
+ {
+  "role": "user",
+  "content": "Ben sana onu demek istemeyeyim, farklı bir şey söylemek istedim."
+ },
+ {
+  "role": "assistant",
+  "content": "Anladım! Ne yapmak istiyorsun? 😊"
+ },
+ {
+  "role": "user",
+  "content": "Benim için ne yapabilirsin?"
+ },
+ {
+  "role": "assistant",
+  "content": "Senin için güzel şeyler yaparım! 🌼 Bugün seninle konuşabiliriz, hikaye anlatabilirim ya da bir plan yapabiliriz. Ne istiyorsun? 😊"
+ }
+]
