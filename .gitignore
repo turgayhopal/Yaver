@@ -1,0 +1,8 @@
+venv/
+llama/
+modeller/
+sesler/
+__pycache__/
+*.pyc
+gecmis.json
+hafiza.json
