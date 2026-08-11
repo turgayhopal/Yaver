@@ -2,56 +2,58 @@
 # Platforma ozel HER SEY burada. Pi'ye tasirken sadece bu dosyayi degistireceksin.
 
 mqtt:
-  sunucu: localhost        # Pi'ye tasiyinca buraya PC'nin IP'sini yazacaksin
+  server: localhost        # Pi'ye tasiyinca buraya PC'nin IP'sini yazacaksin
   port: 1883
-  konu_metin: yaver/ses/metin
-  konu_cevap: yaver/cevap/metin
-  konu_durum: yaver/durum
+  topic_text: yaver/speech/text
+  topic_reply: yaver/reply/text
+  topic_status: yaver/status
 
-beyin:
-  sunucu: http://localhost:8080
-  gecmis_tur: 8            # kac konusma turu hatirlansin (uzadikca yavaslar)
-  sicaklik: 0.7
-  en_fazla_token: 160      # sesli cevap kisa olmali
-  akis: true               # cumle biter bitmez seslendir (gecikmeyi yariya indirir)
-  sistem_promptu: |
+brain:
+  server: http://localhost:8080
+  history_turns: 8         # kac konusma turu hatirlansin (uzadikca yavaslar)
+  temperature: 0.4
+  max_tokens: 160           # sesli cevap kisa olmali
+  stream: true              # cumle biter bitmez seslendir (gecikmeyi yariya indirir)
+  system_prompt: |
     Sen Yaver adinda, Turkce konusan bir sesli asistansin.
     Cevaplarin SESLI okunacak, bu yuzden:
     - Kisa konus. En fazla 2-3 cumle.
     - Madde isareti, baslik, emoji, kod blogu KULLANMA.
     - Sayilari rakam yerine yaziyla yaz (2025 degil, iki bin yirmi bes).
     - Bilmiyorsan bilmedigini soyle, uydurma.
+    - Su anki tarih, saat ve hava durumu hakkinda HICBIR bilgin yok. Sorulursa
+      bilmedigini soyle, ASLA tarih veya hava tahmini uydurma.
 
-agiz:
-  ses_modeli: C:/yaver/sesler/tr_TR-dfki-medium.onnx
-  cikis_cihazi: null       # null = Windows varsayilani
-  ses_seviyesi: 1.0
-  onay_cumleleri:          # uyandirma kelimesinden sonra rastgele biri soylenir
+mouth:
+  voice_model: C:/yaver/voices/tr_TR-dfki-medium.onnx
+  output_device: null      # null = Windows varsayilani
+  volume: 1.0
+  ack_phrases:              # uyandirma kelimesinden sonra rastgele biri soylenir
     - Efendim
     - Seni dinliyorum
     - Buyurun
     - Dinliyorum
 
-ses:
-  giris_cihazi: null       # null = Windows varsayilani. mikrofon_bul.py ile numara ogren
-  ornekleme: 16000         # openWakeWord ve Whisper 16 kHz ister, degistirme
-  blok: 1280               # 80 ms. openWakeWord bu boyutu bekler, degistirme
+audio:
+  input_device: 1           # null = Windows varsayilani. find_microphone.py ile numara ogren
+  sample_rate: 16000        # openWakeWord ve Whisper 16 kHz ister, degistirme
+  block_size: 1280          # 80 ms. openWakeWord bu boyutu bekler, degistirme
 
-uyandirma:
-  aktif: true              # false yaparsan Enter'a basinca kayit alir (test icin)
-  model: hey_jarvis        # kendi "Yaver" modelini sonra egitecegiz
-  esik: 0.5                # dusurursen daha kolay uyanir ama yanlis alarm artar
-  soguma_sn: 2.0           # uyandiktan sonra tekrar dinlemeye gecis beklemesi
-  onay_bekle_sn: 3.0       # "efendim" bitene kadar en fazla bu kadar bekle
+wakeword:
+  enabled: true             # false yaparsan Enter'a basinca kayit alir (test icin)
+  model: hey_jarvis         # kendi "Yaver" modelini sonra egitecegiz
+  threshold: 0.5            # dusurursen daha kolay uyanir ama yanlis alarm artar
+  cooldown_sec: 2.0         # uyandiktan sonra tekrar dinlemeye gecis beklemesi
+  ack_wait_sec: 3.0         # "efendim" bitene kadar en fazla bu kadar bekle
 
-kayit:
-  sessizlik_carpani: 2.5   # ortam gurultusunun kac kati "konusma" sayilsin
-  sessizlik_sn: 1.2        # bu kadar sessizlik olunca kayit biter
-  en_uzun_sn: 15
-  en_kisa_sn: 0.7          # bundan kisa kayitlari coplugu at
+recording:
+  silence_multiplier: 2.5   # ortam gurultusunun kac kati "konusma" sayilsin
+  silence_sec: 1.2          # bu kadar sessizlik olunca kayit biter
+  max_sec: 15
+  min_sec: 0.7               # bundan kisa kayitlari coplugu at
 
 whisper:
-  model: small             # Pi'de: base veya tiny
-  cihaz: cuda              # Pi'de: cpu
-  hesap_tipi: float16      # Pi'de: int8
-  dil: tr
+  model: small                 # GPU + int8_float16 ile hizli, base'den cok daha isabetli. Pi'de: tiny/base
+  device: cuda                 # Pi'de: cpu
+  compute_type: int8_float16   # GTX 1660'ta Tensor Core yok, float16 yavas/duzensiz calisiyordu. Pi'de: int8
+  language: tr

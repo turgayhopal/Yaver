@@ -1,0 +1,7 @@
+Modeli Calistirma
+
+cd C:\yaver\llama
+llama-server.exe -m C:\yaver\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf --ctx-size 8128 --n-gpu-layers 99 --port 8080 --jinja
+
+Activate
+C:\yaver\venv\Scripts\activate

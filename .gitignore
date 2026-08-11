@@ -1,8 +1,8 @@
 venv/
 llama/
-modeller/
-sesler/
+models/
+voices/
 __pycache__/
 *.pyc
-gecmis.json
-hafiza.json
+history.json
+memory.json
