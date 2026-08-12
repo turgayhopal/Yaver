@@ -8,6 +8,16 @@ mqtt:
   topic_reply: yaver/reply/text
   topic_status: yaver/status
 
+skills:
+  topic_request: yaver/skill/request   # brain -> skills: {"id","name","params"}
+  topic_result: yaver/skill/result     # skills -> brain: {"id","name","status","data"}
+  topic_list: yaver/skill/list         # skills -> brain: mevcut araclarin listesi (retained)
+  timeout_sec: 5.0                     # bir arac cagrisinin sonucu icin en fazla bekleme
+
+devices:
+  pico_led:
+    topic: yaver/device/pico-led       # Pico W bu konuyu dinler, "on"/"off" payload'u bekler
+
 brain:
   server: http://localhost:8080
   history_turns: 4         # kac konusma turu hatirlansin. Kucuk model uzun gecmiste
@@ -26,6 +36,11 @@ brain:
     - Bilmiyorsan bilmedigini soyle, uydurma.
     - Su anki tarih, saat ve hava durumu hakkinda HICBIR bilgin yok. Sorulursa
       bilmedigini soyle, ASLA tarih veya hava tahmini uydurma.
+    - Bir cihazi degistirmen istendiginde (orn. LED ac/kapat) SADECE ilgili
+      araci gercekten cagirarak yapabilirsin. Araci cagirmadan "yaptim",
+      "acildi", "sondu" gibi bir seyi basardigini ASLA soyleme - onceki
+      konusmada bir arac cagirmis olman, simdiki istek icin de cagirmana
+      gerek olmadigi anlamina gelmez, her istek icin ayri ayri cagir.
 
 mouth:
   voice_model: C:/yaver/voices/tr_TR-dfki-medium.onnx
@@ -64,3 +79,5 @@ whisper:
   device: cuda                 # Pi'de: cpu
   compute_type: int8_float16   # GTX 1660'ta Tensor Core yok, float16 yavas/duzensiz calisiyordu. Pi'de: int8
   language: tr
+  hotwords: "Yaver LED"        # nadir/yabanci kelimeler icin Whisper'a ipucu (yanlis duymayi azaltir).
+                                # yeni bir skill nadir bir kelime/isim kullanirsa buraya da ekle

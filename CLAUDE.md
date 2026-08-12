@@ -7,7 +7,9 @@ sesli asistan. Jarvis benzeri ama kademeli: önce basit soru-cevap, sonra ev
 otomasyonu, en sonunda drone/derleme gibi gerçek görevler.
 
 **Şu anki aşama:** PC üzerinde tam zincir çalışıyor (duyuyor → anlıyor → cevap
-veriyor → konuşuyor). Sıradaki iş: yetenek (tool calling) katmanı.
+veriyor → konuşuyor), ve ilk yetenek (tool calling) katmanı canlı: Yaver bir
+Pico W kartındaki LED'i sesle yakıp söndürebiliyor (demo). Sıradaki iş: daha
+fazla yetenek (hafıza yazma, saat/tarih) ve söz kesme.
 
 ## Değişmez kısıtlar
 
@@ -37,12 +39,19 @@ STM32MP157D-DK1'in M4 çekirdeği ileride gerçek zamanlı donanım kontrolü
 ```
 mikrofon → [ear] → MQTT → [brain] → MQTT → [mouth] → hoparlör
                               ↕
-                          [skills]   (henüz yazılmadı)
+                          [skills] → MQTT → fiziksel cihazlar (örn. Pico W)
 ```
 
 Modüller birbirinin varlığını bilmez, sadece MQTT konularını bilir. Bir modül
 kapalıyken diğerleri çalışmaya devam eder (ear, mouth yoksa onay beklemez;
-brain, LLM kapalıysa hata cümlesi yayınlar).
+brain, LLM kapalıysa hata cümlesi yayınlar; skills kapalıysa brain hiç arac
+tanıtmaz, LLM normal sohbet eder).
+
+`skills.py` de aynı kurala uyar: kendi arac (tool) fonksiyonlarını bir
+registry'de tutar (`@skill` dekoratörü), her yeni arac ayrı bir fonksiyon,
+`skills.py`'nin çekirdeğine (MQTT akışı, `run_skill`) dokunmaz. `brain.py`
+mevcut araçları **dinamik olarak** öğrenir (`yaver/skill/list`, retained
+mesaj) — yeni bir arac eklemek `brain.py`'de kod değişikliği gerektirmez.
 
 ### MQTT sözleşmesi
 
@@ -63,30 +72,49 @@ Bu şema projenin omurgası. Değiştirilecekse tüm modüller birlikte güncell
   erken "done" ear'ın mouth'un kendi sesini dinleyip geri besleme döngüsüne
   girmesine yol açar)
 
-Henüz yazılmayan, tasarımı belli olan konular:
-- `yaver/skill/request` : brain → skills, `{"name": "...", "params": {...}}`
-- `yaver/skill/result` : skills → brain, `{"name": "...", "status": "ok", "data": ...}`
+Araç (skill) konuları:
+
+| Konu | Yön | Yük |
+|---|---|---|
+| `yaver/skill/request` | brain → skills | `{"id": "...", "name": "...", "params": {...}}` |
+| `yaver/skill/result` | skills → brain | `{"id": "...", "name": "...", "status": "ok\|error", "data": ...}` |
+| `yaver/skill/list` | skills → brain (retained) | OpenAI uyumlu tool-schema listesi, açılışta ve her `skills.py` başlangıcında yayınlanır |
+
+`id`, brain'in eşzamanlı bekleyen istekleri sonuçla eşleştirmesi için
+(`call_skill()` bir `threading.Event` ile MQTT ağ thread'inden ayrı bir
+worker thread'de bekler — aksi halde ağ thread'i kendi cevabını işlemek
+için kilitlenirdi).
+
+Cihaz konuları (skill fonksiyonlarının doğrudan konuştuğu fiziksel
+cihazlar, `config.yaml`'ın `devices` bölümünde tanımlı):
+
+| Konu | Yön | Yük |
+|---|---|---|
+| `yaver/device/pico-led` | skills → Pico W | düz metin: `"on"` / `"off"` |
 
 ## Dosya düzeni
 
 ```
 C:\yaver\
 ├── config.yaml          TÜM ayarlar. Platforma özel her şey burada.
-├── ear.py                mikrofon + uyandırma + konuşma tanıma
-├── brain.py               LLM istemcisi + hafıza + cümle akışı
+├── ear.py                mikrofon + uyandırma/tetik + konuşma tanıma
+├── brain.py               LLM istemcisi + hafıza + cümle akışı + arac cagirma
 ├── mouth.py               seslendirme + çalma kuyruğu
+├── skills.py              arac (tool) registry + fiziksel cihaz kontrolu
 ├── find_microphone.py     yardımcı: ses cihazlarını listeler/test eder
 ├── memory.json            kalıcı bilgiler (otomatik oluşur)
 ├── history.json           son konuşma turları (otomatik oluşur)
 ├── voices/                Piper ses modeli (.onnx + .onnx.json)
 ├── models/                LLM gguf dosyası
 ├── llama/                 llama.cpp binary'leri
+├── pico_w/                Pico W MicroPython kodu (main.py, secrets_example.py)
+│                          secrets.py .gitignore'da - Thonny ile karta yuklenir
 └── venv/                  Python 3.11 sanal ortamı
 ```
 
 ## Çalıştırma
 
-Dört ayrı terminal, hepsinde `venv` aktif:
+Beş ayrı terminal, Python olanların hepsinde `venv` aktif:
 
 ```bash
 # 1. LLM sunucusu (bkz. Commands.txt)
@@ -94,11 +122,22 @@ cd C:\yaver\llama
 llama-server.exe -m C:\yaver\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf ^
   --ctx-size 8128 --n-gpu-layers 99 --port 8080 --jinja
 
-# 2, 3, 4
+# 2, 3, 4, 5 (skills olmadan da her sey calisir, sadece arac cagirma devre disi kalir)
 python brain.py
 python mouth.py
 python ear.py
+python skills.py
 ```
+
+Fiziksel cihazlar (örn. Pico W, `pico_w/main.py`) ayrı, kendi başına çalışır —
+bir terminal değil, Thonny ile yüklenip karta kaydedilir, açılışta otomatik
+başlar. Mosquitto'nun aynı ağdaki cihazlardan bağlantı kabul etmesi için
+`mosquitto.conf`'a `listener 1883 0.0.0.0` + `allow_anonymous true` eklenmiş
+ve Windows Güvenlik Duvarı'nda 1883 için gelen kural açılmış olmalı — bu PC'de
+zaten yapıldı (bkz. Bilinen sorunlar altında Pi 5 notu, aynı ayarlar orada da
+gerekecek). **Dikkat:** Windows bir Wi-Fi ağını "Public" olarak sınıflandırırsa
+Private-only güvenlik duvarı kuralı uygulanmaz — `Get-NetConnectionProfile` ile
+kontrol et, gerekirse `Set-NetConnectionProfile -NetworkCategory Private`.
 
 `llama/` klasöründeki ikili dosyalar llama.cpp'nin resmi GitHub sürümünden
 CUDA 12.4 build'i — bu GPU'nun sürücüsü (CUDA 13.1'e kadar destekliyor) CUDA
@@ -124,7 +163,9 @@ python find_microphone.py       # cihazları listele
 | Konuşma tanıma | faster-whisper, `small` model | GPU/int8_float16, ~0.5 sn |
 | LLM | llama.cpp server (CUDA 12.4 build) + Qwen3-4B-Instruct-2507 Q4_K_M | OpenAI uyumlu API, port 8080, GPU'da ~45 tok/sn |
 | Seslendirme | Piper, `tr_TR-dfki-medium` | onay cümleleri açılışta önceden sentezlenir |
-| Mesajlaşma | Mosquitto (MQTT), localhost:1883 | |
+| Mesajlaşma | Mosquitto (MQTT), 0.0.0.0:1883 | LAN'a açık (kimlik doğrulamasız, ev ağı) - fiziksel cihazlar da bağlanabilsin diye |
+| Araç çağırma | llama.cpp `tools` (OpenAI uyumlu) | `brain.py` karar turu stream'siz, asıl cevap stream'li (2 LLM çağrısı) |
+| Gömülü kart | Raspberry Pi Pico W, MicroPython + `umqtt.simple` | `pico_w/main.py`, ilk demo: dahili LED aç/kapat |
 
 ## Kod konvansiyonları
 
@@ -151,6 +192,10 @@ python find_microphone.py       # cihazları listele
   biri her turda değişirse (örn. canlı saat damgası) önbellek daha ilk
   farktan sonra tamamen geçersiz kalıyor ve tüm bağlam sıfırdan işleniyor —
   yaşanmış ve tekrar tekrar hata ayıklanmış bir performans/doğruluk sorunu.
+- **Kimlik bilgisi (WiFi şifresi vb.) asla git'e girmez.** `pico_w/secrets.py`
+  `.gitignore`'da; sadece `pico_w/secrets_example.py` (placeholder) takip
+  edilir. Yeni bir cihaz/entegrasyon kimlik bilgisi gerektirirse aynı deseni
+  kullan: `*_example.py` commit edilir, gerçek dosya gitignore'a eklenir.
 
 ## Uyandırma modu: openWakeWord yerine metin-içi tetik kelime
 
@@ -174,7 +219,12 @@ filtre olarak bu moda dönülür.
 **Çalışıyor:** metin-içi tetik kelime ("yaver" cümlede geçince cevap verir),
 Türkçe tanıma (GPU'da, isabetli, ~0.5 sn), LLM cevabı (GPU'da, ~45 tok/sn),
 cümle cümle akışlı seslendirme, ağız konuşurken kulağın susması, kalıcı
-konuşma geçmişi.
+konuşma geçmişi, arac cagirma (Pico W LED demo uctan uca calisiyor).
+
+**Bilinen model tuhaflığı:** küçük 4B model bazen bir araci çağırmadan
+"yaptım" diye uydurabiliyor (özellikle ayni araç bir önceki turda başarıyla
+çağrılmışsa) - sistem promptunda bunu açıkça yasaklayan bir kural var ama
+%100 güvenilir değil, izlemeye devam et.
 
 **Bilinen sorunlar:**
 
@@ -190,17 +240,21 @@ konuşma geçmişi.
 
 ## Sıradaki işler (öncelik sırasıyla)
 
-1. **`skills.py`** — LLM'i araç çağırıcı olarak kullan. llama.cpp `--jinja`
-   ile OpenAI uyumlu tool calling destekliyor. İlk araçlar: saat/tarih, basit
-   hesap, zamanlayıcı. Her araç ayrı bir fonksiyon, kayıt (registry) üzerinden.
+1. **Daha fazla yetenek (skill)** — `skills.py`'ye yeni `@skill` fonksiyonları
+   ekle: saat/tarih, basit hesap, zamanlayıcı, drone kontrolü, proje derleme.
+   Mimari hazır, her biri sadece yeni bir fonksiyon + registry kaydı.
 2. **Hafıza yazma** — "Yaver, adımın Mehmet olduğunu hatırla" → `memory.json`.
-   Bunu da bir yetenek olarak yap, beyne gömme.
+   Bunu da bir yetenek (skill) olarak yap, beyne gömme.
 3. **Söz kesme** (yukarıdaki 1. sorun).
-4. **Özel "Yaver" uyandırma modeli** — düşük öncelik, gerekmedikçe ertelendi
+4. **Gerçek dünya etkisi olan yetenekler için onay adımı** — drone kontrolü ya
+   da proje derleme gibi geri alınamaz/riskli eylemlerden önce sesli onay
+   ("Emin misin?") istemek. LED demosunda gerekmedi ama ölçek büyüdükçe lazım.
+5. **Özel "Yaver" uyandırma modeli** — düşük öncelik, gerekmedikçe ertelendi
    (bkz. yukarıdaki "Uyandırma modu" bölümü).
-5. **Pi 5'e taşıma** — `config.yaml`'da yol/cihaz/model değişiklikleri,
+6. **Pi 5'e taşıma** — `config.yaml`'da yol/cihaz/model değişiklikleri,
    `whisper.device: cpu`, daha küçük LLM. Kod değişmemeli; değişmesi gerekiyorsa
-   o bir tasarım hatasıdır, önce onu düzelt.
+   o bir tasarım hatasıdır, önce onu düzelt. Mosquitto'nun LAN listener +
+   firewall ayarları da yeni ortamda tekrarlanmalı.
 
 ## Yapılmayacaklar
 

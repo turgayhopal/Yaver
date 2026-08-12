@@ -247,10 +247,10 @@ def transcribe(whisper, audio):
         vad_filter=True,
         condition_on_previous_text=False,
         no_speech_threshold=0.6,
-        # trigger kelimesi ("Yaver") kucuk/nadir bir ozel isim oldugu icin Whisper
-        # bunu siklikla benzer sesli yaygin kelimelere ceviriyordu (Ya var, yavar,
-        # Ya ver). hotwords bu kelimenin taninma olasiligini artirir.
-        hotwords=CONFIG["wakeword"]["trigger_word"].capitalize(),
+        # Nadir/yabanci kelimeler ("Yaver", "LED" gibi) Whisper tarafindan siklikla
+        # benzer sesli yaygin kelimelere cevriliyordu (Ya var, Lady, L'de...).
+        # hotwords bunlarin taninma olasiligini artirir - bkz. config.yaml.
+        hotwords=CONFIG["whisper"]["hotwords"],
     )
     text = " ".join(s.text.strip() for s in segments).strip()
     print(f"  ({duration:.1f} sn ses -> {time.time() - t0:.2f} sn cevrim)")

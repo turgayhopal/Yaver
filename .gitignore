@@ -6,3 +6,4 @@ __pycache__/
 *.pyc
 history.json
 memory.json
+pico_w/secrets.py
