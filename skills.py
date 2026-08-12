@@ -33,21 +33,47 @@ def skill(name, description, parameters):
     return decorator
 
 
+def devices_by_type(device_type):
+    """config.yaml'daki genel cihaz kayit defterinden belirli turdeki (orn.
+    "led") tum cihazlari dondurur. Yeni bir skill de kendi turunu boyle
+    sorgular - cihaz eklemek/cikarmak icin skill kodu degismez."""
+    return {
+        name: cfg for name, cfg in CONFIG.get("devices", {}).items()
+        if cfg.get("type") == device_type
+    }
+
+
+def device_param_schema(device_type):
+    """Bir skill'in 'device' parametresi icin, kayitli cihazlardan turetilen
+    JSON-schema (enum + LLM'in 'hangi cihaz' ayrimini yapmasi icin aciklama)."""
+    devices = devices_by_type(device_type)
+    descriptions = "; ".join(f"{name} = {cfg['label']}" for name, cfg in devices.items())
+    return {
+        "type": "string",
+        "enum": list(devices.keys()),
+        "description": f"Hangi cihaz kontrol edilecek. Secenekler: {descriptions}",
+    }
+
+
 # --------------------------------------------------------------------------- araclar
 @skill(
     name="led_control",
-    description="Pico W kartindaki dahili LED'i yakar veya sondurur.",
+    description="Kayitli bir LED cihazini yakar veya sondurur.",
     parameters={
         "type": "object",
         "properties": {
+            "device": device_param_schema("led"),
             "state": {"type": "string", "enum": ["on", "off"], "description": "LED'in yeni durumu"},
         },
-        "required": ["state"],
+        "required": ["device", "state"],
     },
 )
-def led_control(client, state):
-    client.publish(CONFIG["devices"]["pico_led"]["topic"], state)
-    return {"state": state}
+def led_control(client, device, state):
+    devices = devices_by_type("led")
+    if device not in devices:
+        raise ValueError(f"bilinmeyen LED cihazi: {device}")
+    client.publish(devices[device]["topic"], state)
+    return {"device": device, "state": state}
 
 
 # --------------------------------------------------------------------------- MQTT

@@ -34,7 +34,9 @@ BRAIN = CONFIG["brain"]
 MEMORY_FILE = ROOT / "memory.json"    # kalici bilgiler (ad, tercihler)
 HISTORY_FILE = ROOT / "history.json"  # son konusma turlari
 
-history = deque(maxlen=BRAIN["history_turns"] * 2)
+history = deque(maxlen=BRAIN["history_turns"])  # her eleman bir TURUN mesaj listesi
+# (tek mesaj degil) - boylece bir arac turu (4 mesaj: soru, arac cagrisi, arac
+# sonucu, cevap) sinir asilinca ortadan kesilip yetim bir "tool" mesaji birakmaz.
 
 client_ref = [None]        # MQTT istemcisi - --ask modunda None kalir, arac cagirma atlanir
 available_tools = []       # skills.py'den ogrenilen guncel arac (tool) listesi
@@ -52,17 +54,26 @@ def read_memory():
 
 
 def read_history():
-    if HISTORY_FILE.exists():
-        try:
-            for m in json.loads(HISTORY_FILE.read_text(encoding="utf-8")):
-                history.append(m)
-        except json.JSONDecodeError:
-            pass
+    if not HISTORY_FILE.exists():
+        return
+    try:
+        flat = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    turn = []
+    for m in flat:
+        if m.get("role") == "user" and turn:
+            history.append(turn)
+            turn = []
+        turn.append(m)
+    if turn:
+        history.append(turn)
 
 
 def write_history():
+    flat = [m for turn in history for m in turn]
     HISTORY_FILE.write_text(
-        json.dumps(list(history), ensure_ascii=False, indent=1), encoding="utf-8"
+        json.dumps(flat, ensure_ascii=False, indent=1), encoding="utf-8"
     )
 
 
@@ -185,10 +196,12 @@ def ask(question, on_sentence=None):
     kapaliysa) bu adim tamamen atlanir, davranis oncekiyle birebir aynidir.
     """
     messages = [{"role": "system", "content": system_prompt()}]
-    messages += list(history)
+    for turn in history:
+        messages.extend(turn)
     messages.append({"role": "user", "content": question})
 
     full_text = None
+    tool_messages = []  # bu turda kullanildiysa: [decision, tool_sonucu] - gecmise de yazilir
 
     if available_tools and client_ref[0] is not None:
         decision_body = {
@@ -212,12 +225,14 @@ def ask(question, on_sentence=None):
             print(f"  [arac] {name}({params})")
             result = call_skill(name, params)
             print(f"  [arac sonucu] {result}")
-            messages.append(decision)
-            messages.append({
+            tool_result_message = {
                 "role": "tool",
                 "tool_call_id": call["id"],
                 "content": json.dumps(result, ensure_ascii=False),
-            })
+            }
+            messages.append(decision)
+            messages.append(tool_result_message)
+            tool_messages = [decision, tool_result_message]
         elif decision.get("content"):
             # Arac gerekmedi, cevap zaten elimizde - ikinci bir tur gerekmez.
             full_text = decision["content"].strip()
@@ -227,8 +242,12 @@ def ask(question, on_sentence=None):
     if full_text is None:
         full_text = stream_reply(messages, on_sentence)
 
-    history.append({"role": "user", "content": question})
-    history.append({"role": "assistant", "content": full_text})
+    # Tum tur (soru + varsa arac cagrisi/sonucu + cevap) TEK GRUP olarak eklenir -
+    # boylece maxlen asilinca grup butun halinde dusurulur, ortadan kesilmez.
+    turn = [{"role": "user", "content": question}]
+    turn.extend(tool_messages)  # arac gercekten cagirildiysa bunu da hatirla,
+    turn.append({"role": "assistant", "content": full_text})  # yoksa model sadece
+    history.append(turn)  # onceki onay cumlesini taklit edip araci atlamaya basliyor
     write_history()
     return full_text
 
@@ -303,7 +322,7 @@ def main():
 
     read_history()
     threading.Thread(target=worker, daemon=True).start()
-    print(f"Beyin hazir. LLM: {BRAIN['server']}  (gecmis: {len(history)//2} tur)")
+    print(f"Beyin hazir. LLM: {BRAIN['server']}  (gecmis: {len(history)} tur)")
     client.loop_forever()
 
 

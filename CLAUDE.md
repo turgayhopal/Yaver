@@ -53,6 +53,17 @@ registry'de tutar (`@skill` dekoratörü), her yeni arac ayrı bir fonksiyon,
 mevcut araçları **dinamik olarak** öğrenir (`yaver/skill/list`, retained
 mesaj) — yeni bir arac eklemek `brain.py`'de kod değişikliği gerektirmez.
 
+**Cihazlar da aynı şekilde genel bir kayıt defterinden (`config.yaml` →
+`devices`) okunur.** Her cihaz bir `type` (örn. `led`), bir `label` (LLM'e
+gösterilen, "hangi cihaz" ayrımını yapmasını sağlayan açıklama) ve bir MQTT
+konusuyla tanımlanır. Bir skill (örn. `led_control`) kendi türündeki TÜM
+cihazları `skills.py`'deki `devices_by_type()` ile sorgular ve LLM'e "hangi
+cihaz" parametresini bir enum olarak sunar (`device_param_schema()`). **Yeni
+bir fiziksel LED/kart eklemek = `config.yaml`'a yeni bir `devices` girdisi +
+o cihazın kartına (bkz. `boards/`) küçük bir MicroPython dosyası — skill
+kodu değişmez.** Aynı desen ileride drone, başka kart türleri, vb. için de
+geçerli: yeni bir `type` + o türü sorgulayan yeni bir `@skill` fonksiyonu.
+
 ### MQTT sözleşmesi
 
 Bu şema projenin omurgası. Değiştirilecekse tüm modüller birlikte güncellenmeli.
@@ -85,12 +96,12 @@ Araç (skill) konuları:
 worker thread'de bekler — aksi halde ağ thread'i kendi cevabını işlemek
 için kilitlenirdi).
 
-Cihaz konuları (skill fonksiyonlarının doğrudan konuştuğu fiziksel
-cihazlar, `config.yaml`'ın `devices` bölümünde tanımlı):
+Cihaz konuları (her cihazın kendi konusu, `config.yaml`'ın `devices`
+bölümünde tanımlı — bkz. yukarıdaki genel cihaz kayıt defteri açıklaması):
 
 | Konu | Yön | Yük |
 |---|---|---|
-| `yaver/device/pico-led` | skills → Pico W | düz metin: `"on"` / `"off"` |
+| `yaver/device/pico_led_masa` | skills → Pico W (`boards/pico_w`) | düz metin: `"on"` / `"off"` |
 
 ## Dosya düzeni
 
@@ -107,8 +118,10 @@ C:\yaver\
 ├── voices/                Piper ses modeli (.onnx + .onnx.json)
 ├── models/                LLM gguf dosyası
 ├── llama/                 llama.cpp binary'leri
-├── pico_w/                Pico W MicroPython kodu (main.py, secrets_example.py)
-│                          secrets.py .gitignore'da - Thonny ile karta yuklenir
+├── boards/                Her fiziksel kart icin ayri bir alt klasor
+│   └── pico_w/            Pico W MicroPython kodu (main.py, secrets_example.py)
+│                          secrets.py .gitignore'da (boards/*/secrets.py) -
+│                          Thonny ile karta yuklenir, bu PC'de calismaz
 └── venv/                  Python 3.11 sanal ortamı
 ```
 
@@ -129,7 +142,7 @@ python ear.py
 python skills.py
 ```
 
-Fiziksel cihazlar (örn. Pico W, `pico_w/main.py`) ayrı, kendi başına çalışır —
+Fiziksel cihazlar (örn. Pico W, `boards/pico_w/main.py`) ayrı, kendi başına çalışır —
 bir terminal değil, Thonny ile yüklenip karta kaydedilir, açılışta otomatik
 başlar. Mosquitto'nun aynı ağdaki cihazlardan bağlantı kabul etmesi için
 `mosquitto.conf`'a `listener 1883 0.0.0.0` + `allow_anonymous true` eklenmiş
@@ -165,7 +178,7 @@ python find_microphone.py       # cihazları listele
 | Seslendirme | Piper, `tr_TR-dfki-medium` | onay cümleleri açılışta önceden sentezlenir |
 | Mesajlaşma | Mosquitto (MQTT), 0.0.0.0:1883 | LAN'a açık (kimlik doğrulamasız, ev ağı) - fiziksel cihazlar da bağlanabilsin diye |
 | Araç çağırma | llama.cpp `tools` (OpenAI uyumlu) | `brain.py` karar turu stream'siz, asıl cevap stream'li (2 LLM çağrısı) |
-| Gömülü kart | Raspberry Pi Pico W, MicroPython + `umqtt.simple` | `pico_w/main.py`, ilk demo: dahili LED aç/kapat |
+| Gömülü kart | Raspberry Pi Pico W, MicroPython + `umqtt.simple` | `boards/pico_w/main.py`, ilk demo: dahili LED aç/kapat |
 
 ## Kod konvansiyonları
 
@@ -192,10 +205,17 @@ python find_microphone.py       # cihazları listele
   biri her turda değişirse (örn. canlı saat damgası) önbellek daha ilk
   farktan sonra tamamen geçersiz kalıyor ve tüm bağlam sıfırdan işleniyor —
   yaşanmış ve tekrar tekrar hata ayıklanmış bir performans/doğruluk sorunu.
-- **Kimlik bilgisi (WiFi şifresi vb.) asla git'e girmez.** `pico_w/secrets.py`
-  `.gitignore`'da; sadece `pico_w/secrets_example.py` (placeholder) takip
-  edilir. Yeni bir cihaz/entegrasyon kimlik bilgisi gerektirirse aynı deseni
-  kullan: `*_example.py` commit edilir, gerçek dosya gitignore'a eklenir.
+- **Kimlik bilgisi (WiFi şifresi vb.) asla git'e girmez.** `boards/*/secrets.py`
+  `.gitignore`'da; sadece `secrets_example.py` (placeholder) takip edilir.
+  Yeni bir kart/entegrasyon kimlik bilgisi gerektirirse aynı deseni kullan:
+  `*_example.py` commit edilir, gerçek dosya gitignore'a eklenir.
+- **`brain.py`'nin `history`'si tur bazında gruplanır** (tek tek mesaj değil,
+  bkz. `deque(maxlen=BRAIN["history_turns"])`) — bir arac turu 4 mesajdan
+  (soru, arac çağrısı, arac sonucu, cevap) oluşur, sınır dolunca bir turun
+  ortadan kesilip bozuk bir mesaj dizisi (yetim `"tool"` mesajı) bırakmaması
+  için. Aracın gerçekten çağrıldığını gösteren mesajlar da geçmişe yazılır -
+  sadece son cümleyi tutmak, küçük modelin bir sonraki turda aracı çağırmadan
+  kendi eski onay cümlesini taklit etmesine yol açıyordu (yaşanmış sorun).
 
 ## Uyandırma modu: openWakeWord yerine metin-içi tetik kelime
 

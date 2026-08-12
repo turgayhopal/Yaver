@@ -15,8 +15,15 @@ skills:
   timeout_sec: 5.0                     # bir arac cagrisinin sonucu icin en fazla bekleme
 
 devices:
-  pico_led:
-    topic: yaver/device/pico-led       # Pico W bu konuyu dinler, "on"/"off" payload'u bekler
+  # Genel cihaz kayit defteri - burada tanimli her cihaz, ayni "type"a sahip
+  # skill'ler tarafindan otomatik gorulur (bkz. skills.py led_devices()).
+  # Yeni bir fiziksel LED/kart eklemek icin sadece buraya yeni bir girdi ekle,
+  # skill kodu degismez. Anahtar (orn. pico_led_masa) MQTT topic'inde ve
+  # LLM'in sececegi kimlik olarak kullanilir - benzersiz ve sabit tut.
+  pico_led_masa:
+    type: led                          # skill'lerin cihazi filtrelemek icin kullandigi tur etiketi
+    label: "masadaki Pico W'nin dahili LED'i"  # LLM'e gosterilir, "hangi cihaz" ayrimini bununla yapar
+    topic: yaver/device/pico_led_masa    # bu cihaz bu konuyu dinler, "on"/"off" payload'u bekler
 
 brain:
   server: http://localhost:8080
@@ -41,6 +48,10 @@ brain:
       "acildi", "sondu" gibi bir seyi basardigini ASLA soyleme - onceki
       konusmada bir arac cagirmis olman, simdiki istek icin de cagirmana
       gerek olmadigi anlamina gelmez, her istek icin ayri ayri cagir.
+    - Bir aracin "hangi cihaz" secenegi (device gibi) varsa ve kullanici
+      hangisini kastettigini belirtmediyse ya da net degilse: ASLA tahmin
+      etme, rastgele bir cihaz secme, veya aracı hic cagirmadan basardigini
+      soyleme - bunun yerine kullaniciya hangi cihazi kastettigini sor.
 
 mouth:
   voice_model: C:/yaver/voices/tr_TR-dfki-medium.onnx

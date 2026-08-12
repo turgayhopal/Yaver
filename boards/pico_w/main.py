@@ -1,8 +1,10 @@
-"""Yaver - Pico W LED demo.
+"""Yaver - Pico W LED demo (cihaz kimligi: pico_led_masa).
 
 Yaver'in "led_control" skill'inden gelen MQTT mesajlarini dinler, dahili
-LED'i yakar/sondurur. skills.py bu cihaza yaver/device/pico-led konusunda
-"on" ya da "off" yayinlar (bkz. C:\\yaver\\config.yaml devices.pico_led).
+LED'i yakar/sondurur. skills.py bu cihaza C:\\yaver\\config.yaml'daki
+devices.pico_led_masa.topic konusunda "on" ya da "off" yayinlar. Baska bir
+Pico W/LED eklerken: config.yaml'a yeni bir devices girdisi ekle (farkli
+topic ile), bu dosyayi kopyalayip TOPIC sabitini o yeni topic'e cevir.
 
 Kurulum:
     1. Thonny'de Tools > Manage Packages ile "micropython-umqtt.simple" kur
@@ -21,7 +23,7 @@ from umqtt.simple import MQTTClient
 
 import secrets
 
-TOPIC = b"yaver/device/pico-led"
+TOPIC = b"yaver/device/pico_led_masa"
 led = Pin("LED", Pin.OUT)
 
 
@@ -46,7 +48,7 @@ def on_message(topic, msg):
 
 def main():
     wifi_connect()
-    client = MQTTClient("yaver-pico-led", secrets.MQTT_SERVER, port=1883)
+    client = MQTTClient("yaver-pico_led_masa", secrets.MQTT_SERVER, port=1883)
     client.set_callback(on_message)
     client.connect()
     client.subscribe(TOPIC)
