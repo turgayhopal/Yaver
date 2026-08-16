@@ -221,7 +221,7 @@ python find_microphone.py       # cihazları listele
 | Uyandırma | openWakeWord, `hey_jarvis` modeli | özel "Yaver" modeli henüz eğitilmedi |
 | Konuşma tanıma | faster-whisper, `small` model | GPU/int8_float16, ~0.5 sn |
 | LLM | llama.cpp server (CUDA 12.4 build) + Qwen3-4B-Instruct-2507 Q4_K_M | OpenAI uyumlu API, port 8080, `--parallel 1` + kuantali KV-cache + flash-attn ile GPU'da ~55 tok/sn |
-| Seslendirme | Piper, `tr_TR-dfki-medium` | onay cümleleri açılışta önceden sentezlenir |
+| Seslendirme | Piper, `tr_TR-dfki-medium` | onay cümleleri açılışta önceden sentezlenir, `mouth.synthesis` (config.yaml) ile ayarlanmış (bkz. asağıdaki not) |
 | Mesajlaşma | Mosquitto (MQTT), 0.0.0.0:1883 | LAN'a açık (kimlik doğrulamasız, ev ağı) - fiziksel cihazlar da bağlanabilsin diye |
 | Araç çağırma | llama.cpp `tools` (OpenAI uyumlu) | `brain.py`'de karar turu da stream'li (bkz. `stream_decision`) - arac gerekmezse ilk cumle hemen soylenir |
 | Gömülü kart | Raspberry Pi Pico W, MicroPython + `umqtt.simple` | `boards/pico_w/main.py`, ilk demo: dahili LED aç/kapat |
@@ -297,6 +297,26 @@ durum widget'i (`face.py` - bosta/dinliyor/dusunuyor/konusuyor).
 "yaptım" diye uydurabiliyor (özellikle ayni araç bir önceki turda başarıyla
 çağrılmışsa) - sistem promptunda bunu açıkça yasaklayan bir kural var ama
 %100 güvenilir değil, izlemeye devam et.
+
+**Seslendirme motoru değerlendirmesi (yasanmis, tekrar denemeden once oku):**
+Piper'ın Türkçe telaffuzu tatmin etmeyince iki alternatif GPU'da (GTX 1660)
+canlı test edildi:
+- **XTTS-v2** (Coqui, `coqui-tts` paketi) — kalite gerçekten iyi (özellikle
+  referans ses klonlamayla) ama çok yavaş: ısınmış haldeyken bile cümle
+  başına 1.7-5 saniye sentez süresi ölçüldü (Piper'da bu neredeyse sıfır).
+  Toplam "soru bitince Yaver'in konuşmaya başlaması" süresini 2-4 kat
+  artırıyor - bu projenin üzerinde ayrıca uğraştığı "anlık cevap" hedefiyle
+  doğrudan çelişiyor. Karar: kullanılmadı, ama bağımlılıklar (`torch`,
+  `torchaudio`, `coqui-tts`, `transformers<5`) kullanıcı isteğiyle venv'de
+  bırakıldı (~4.5GB) - ileride tekrar denemek istenirse hazır.
+- **MMS-TTS** (Facebook, `transformers` üzerinden) hiç denenmedi, XTTS-v2'ye
+  gecilirken atlandı.
+
+Bunun yerine Piper'ın kendi `SynthesisConfig`'i (`length_scale`, `noise_scale`,
+`noise_w_scale`) dinleyerek ayarlandı - `config.yaml` → `mouth.synthesis`.
+Aynı motor, aynı hız, sadece daha net/temiz telaffuz. `mouth.py`'nin
+`synthesize()` fonksiyonu bunu okuyup `voice.synthesize(text, syn_config=...)`
+ile kullanıyor.
 
 **Bilinen sorunlar:**
 

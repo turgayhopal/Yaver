@@ -69,16 +69,21 @@ def synthesize(voice, text):
 
     Piper'in Python API'si surumden surume degisti, ucunu de deniyoruz.
     """
-    # Yeni API (2.x): synthesize(metin) -> AudioChunk ureteci
+    # Yeni API (2.x): synthesize(metin, syn_config) -> AudioChunk ureteci.
+    # syn_config: config.yaml'daki mouth.synthesis ayarlari - dinleyerek
+    # secildi (bkz. "3-cok temiz+deterministik" varyanti), varsayilan
+    # degerlerden daha net/dogal geldi.
     try:
+        from piper.config import SynthesisConfig
+        syn_config = SynthesisConfig(**MOUTH["synthesis"])
         chunks, rate = [], None
-        for chunk in voice.synthesize(text):
+        for chunk in voice.synthesize(text, syn_config=syn_config):
             chunks.append(np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16))
             rate = chunk.sample_rate
         if chunks:
             return np.concatenate(chunks), rate
-    except TypeError:
-        pass  # eski API iki argüman ister, asagi dusuyoruz
+    except (TypeError, ImportError):
+        pass  # eski API iki argüman ister ya da piper.config yok, asagi dusuyoruz
 
     # Eski API (1.x): wave dosyasina yazar
     buffer = io.BytesIO()
