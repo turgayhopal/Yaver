@@ -1,0 +1,341 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --line-bright: #333d4d;
+    --text-dim: #6b7686;
+    --idle: #3fb8c9;
+    --listen: #39e6a0;
+    --think: #a678ff;
+    --speak: #ff9d47;
+    --accent: var(--idle);
+    --mono: "JetBrains Mono", "Cascadia Code", "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+
+    /* Sabit yuksek-kontrast temeli: koyu masaustu duvar kagidi varsayimiyla
+       (en riskli durum) parlak bir kenar cizgisi + disari dogru koyu golge -
+       arka plan ornekleme (face.py) henuz calismamisken ya da olcum
+       basarisiz olursa bile widget her zaman okunur kalir. */
+    --ring-color: rgba(255,255,255,0.4);
+    --ring-shadow: 0 6px 22px rgba(0,0,0,0.6), 0 0 0 3px rgba(255,255,255,0.06);
+    --text-shadow: 0 0 6px rgba(0,0,0,1), 0 1px 3px rgba(0,0,0,1);
+  }
+
+  /* face.py bu HTML'in arkasindaki gercek masaustu bolgesini periyodik
+     orneklayip acik/koyu oldugunu setBackdrop() ile bildirir - bu sadece
+     iki hazir kontrast paketi arasinda gecis yapar (surekli renk hesaplama
+     degil), boylece asiri karisik olmadan gercekten "arka plana gore
+     degisen" bir gorunum saglar. Iki paket arasindaki fark BILEREK belirgin -
+     ince bir ayar goze cok az fark ediyordu (yasanmis sorun). */
+  :root[data-backdrop="light"] {
+    --ring-color: rgba(8,10,14,0.6);
+    --ring-shadow: 0 6px 20px rgba(0,0,0,0.4), 0 2px 5px rgba(0,0,0,0.3);
+    --text-shadow: 0 1px 4px rgba(255,255,255,1), 0 0 7px rgba(255,255,255,0.9);
+  }
+
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: transparent;
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  .widget-dock {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+    padding: 10px 12px 12px;
+  }
+
+  .telemetry {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-align: right;
+    color: var(--text-dim);
+    line-height: 1.6;
+    text-shadow: var(--text-shadow);
+    transition: text-shadow 0.5s;
+  }
+  .telemetry .state-name {
+    display: block;
+    font-size: 11.5px;
+    color: var(--accent);
+    transition: color 0.4s;
+  }
+  .telemetry .hz { font-variant-numeric: tabular-nums; }
+
+  .orb-wrap { position: relative; width: 152px; height: 152px; }
+
+  .glow {
+    position: absolute;
+    inset: -26px;
+    border-radius: 50%;
+    background: radial-gradient(circle, var(--accent) 0%, transparent 68%);
+    opacity: 0.22;
+    filter: blur(8px);
+    animation: breathe var(--pulse-dur, 4.5s) ease-in-out infinite;
+    transition: background 0.4s;
+  }
+
+  .ring {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    border: 1.5px solid var(--ring-color);
+    box-shadow: var(--ring-shadow), inset 0 0 20px rgba(0,0,0,0.55);
+    transition: border-color 0.5s, box-shadow 0.5s;
+  }
+
+  .viewport {
+    position: absolute;
+    inset: 5px;
+    border-radius: 50%;
+    overflow: hidden;
+    background: radial-gradient(circle at 50% 42%, rgba(21,27,36,0.9) 0%, rgba(11,14,19,0.94) 72%);
+    backdrop-filter: blur(2px);
+  }
+
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+  .ripples { position: absolute; inset: 0; pointer-events: none; }
+  .ripple {
+    position: absolute;
+    inset: 0; margin: auto;
+    width: 40%; height: 40%;
+    border-radius: 50%;
+    border: 1px solid var(--listen);
+    opacity: 0;
+  }
+  [data-state="listening"] .ripple { animation: ripple 2.2s ease-out infinite; }
+  .ripple:nth-child(2) { animation-delay: 0.7s !important; }
+  .ripple:nth-child(3) { animation-delay: 1.4s !important; }
+
+  .eq {
+    position: absolute;
+    left: 50%; bottom: 22%;
+    transform: translateX(-50%);
+    display: flex; align-items: flex-end; gap: 3px;
+    height: 20px;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  [data-state="speaking"] .eq { opacity: 1; }
+  .eq span {
+    width: 3px; background: var(--speak); border-radius: 1px; height: 30%;
+    box-shadow: 0 0 6px var(--speak);
+  }
+  [data-state="speaking"] .eq span { animation: eq 1s ease-in-out infinite; }
+  .eq span:nth-child(1) { animation-delay: -0.9s; }
+  .eq span:nth-child(2) { animation-delay: -0.5s; }
+  .eq span:nth-child(3) { animation-delay: -1.1s; }
+  .eq span:nth-child(4) { animation-delay: -0.2s; }
+  .eq span:nth-child(5) { animation-delay: -0.7s; }
+
+  @keyframes breathe {
+    0%, 100% { transform: scale(0.94); opacity: 0.16; }
+    50% { transform: scale(1.06); opacity: 0.30; }
+  }
+  @keyframes ripple {
+    0%   { transform: scale(0.5); opacity: 0.55; }
+    100% { transform: scale(2.3); opacity: 0; }
+  }
+  @keyframes eq {
+    0%, 100% { height: 20%; }
+    50% { height: 100%; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .glow, .ripple, .eq span { animation-duration: 8s !important; }
+  }
+</style>
+</head>
+<body>
+
+<div class="widget-dock" data-state="idle" id="widget">
+  <div class="telemetry">
+    <span class="state-name" id="stateName">BOŞTA</span>
+    <span class="hz" id="hz">0.4&nbsp;Hz</span>
+  </div>
+  <div class="orb-wrap">
+    <div class="glow"></div>
+    <div class="ring"></div>
+    <div class="viewport">
+      <canvas id="net" width="142" height="142"></canvas>
+      <div class="ripples">
+        <div class="ripple"></div><div class="ripple"></div><div class="ripple"></div>
+      </div>
+      <div class="eq"><span></span><span></span><span></span><span></span><span></span></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var STATES = {
+    idle:      { color: "#3fb8c9", label: "BOŞTA",     speed: 0.35, intensity: 0.35, pulseDur: "4.6s", hz: [0.2, 0.6], sparks: false },
+    listening: { color: "#39e6a0", label: "DİNLİYOR",  speed: 0.7,  intensity: 0.55, pulseDur: "2.4s", hz: [2, 5],     sparks: false },
+    thinking:  { color: "#a678ff", label: "DÜŞÜNÜYOR", speed: 1.9,  intensity: 1.0,  pulseDur: "1.1s", hz: [30, 90],   sparks: true  },
+    speaking:  { color: "#ff9d47", label: "KONUŞUYOR", speed: 1.1,  intensity: 0.8,  pulseDur: "1.7s", hz: [8, 22],    sparks: false }
+  };
+
+  var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var widget = document.getElementById("widget");
+  var stateNameEl = document.getElementById("stateName");
+  var hzEl = document.getElementById("hz");
+  var root = document.documentElement;
+
+  var current = "idle";
+  var hzTarget = 0.4;
+  var hzShown = 0.4;
+
+  function setState(name) {
+    if (!STATES[name]) return;
+    current = name;
+    var s = STATES[name];
+    widget.dataset.state = name;
+    root.style.setProperty("--accent", s.color);
+    widget.style.setProperty("--pulse-dur", s.pulseDur);
+    stateNameEl.textContent = s.label;
+    hzTarget = s.hz[0] + Math.random() * (s.hz[1] - s.hz[0]);
+  }
+  window.setState = setState;
+
+  // face.py'nin arka plan ornekleme thread'i cagirir: "dark" | "light".
+  // Sadece iki hazir kontrast paketi arasinda gecis yapar (bkz. CSS'teki
+  // [data-backdrop] bloklari) - burada renk hesabi yok, gereksiz karmasiklik
+  // eklemeden gercekten arka plana duyarli bir gorunum saglar.
+  window.setBackdrop = function (mode) {
+    document.documentElement.dataset.backdrop = mode === "light" ? "light" : "dark";
+  };
+
+  setInterval(function () {
+    var s = STATES[current];
+    hzTarget = s.hz[0] + Math.random() * (s.hz[1] - s.hz[0]);
+  }, 900);
+
+  (function tickHz() {
+    hzShown += (hzTarget - hzShown) * 0.18;
+    hzEl.textContent = hzShown.toFixed(1) + " Hz";
+    requestAnimationFrame(tickHz);
+  })();
+
+  var canvas = document.getElementById("net");
+  var ctx = canvas.getContext("2d");
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+  var SIZE = 142;
+  canvas.width = SIZE * dpr;
+  canvas.height = SIZE * dpr;
+  ctx.scale(dpr, dpr);
+  var C = SIZE / 2;
+
+  var rings = [
+    { r: 13, n: 3, jitter: [0, 0.4, -0.3] },
+    { r: 32, n: 5, jitter: [0.2, -0.3, 0.35, -0.15, 0.1] },
+    { r: 51, n: 6, jitter: [-0.2, 0.25, -0.1, 0.3, -0.35, 0.15] }
+  ];
+
+  var nodes = [];
+  rings.forEach(function (ring, ri) {
+    for (var i = 0; i < ring.n; i++) {
+      var baseAngle = (i / ring.n) * Math.PI * 2 + ri * 0.5;
+      nodes.push({
+        baseAngle: baseAngle, baseR: ring.r,
+        jitter: ring.jitter[i] || 0,
+        phase: Math.random() * Math.PI * 2,
+        driftSpeed: 0.4 + Math.random() * 0.4
+      });
+    }
+  });
+
+  function nodePos(node, t) {
+    var wobble = Math.sin(t * node.driftSpeed + node.phase) * (2 + node.jitter * 3);
+    var r = node.baseR + wobble;
+    var ang = node.baseAngle + Math.sin(t * 0.15 + node.phase) * 0.06;
+    return { x: C + Math.cos(ang) * r, y: C + Math.sin(ang) * r };
+  }
+
+  var edges = [];
+  for (var a = 0; a < nodes.length; a++) {
+    for (var b = a + 1; b < nodes.length; b++) {
+      var na = nodePos(nodes[a], 0), nb = nodePos(nodes[b], 0);
+      if (Math.hypot(na.x - nb.x, na.y - nb.y) < 37) edges.push({ a: a, b: b, phase: Math.random() * Math.PI * 2 });
+    }
+  }
+
+  var sparks = [];
+  function hexToRgb(hex) {
+    var v = parseInt(hex.slice(1), 16);
+    return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+  }
+
+  var t0 = performance.now();
+  function frame(now) {
+    var s = STATES[current];
+    var speedMul = reduced ? 0.12 : 1;
+    var t = (now - t0) / 1000 * s.speed * speedMul;
+    var rgb = hexToRgb(s.color);
+    var rgbStr = rgb.join(",");
+
+    ctx.clearRect(0, 0, SIZE, SIZE);
+    ctx.fillStyle = "rgba(9,11,15,0.38)";
+    ctx.fillRect(0, 0, SIZE, SIZE);
+
+    var positions = nodes.map(function (n) { return nodePos(n, t); });
+
+    edges.forEach(function (e) {
+      var pa = positions[e.a], pb = positions[e.b];
+      var pulse = 0.35 + 0.65 * Math.max(0, Math.sin(t * 1.3 + e.phase));
+      var alpha = 0.05 + pulse * 0.22 * s.intensity;
+      ctx.strokeStyle = "rgba(" + rgbStr + "," + alpha.toFixed(3) + ")";
+      ctx.lineWidth = 0.8;
+      ctx.beginPath();
+      ctx.moveTo(pa.x, pa.y);
+      ctx.lineTo(pb.x, pb.y);
+      ctx.stroke();
+    });
+
+    positions.forEach(function (p, i) {
+      var glow = 0.5 + 0.5 * Math.sin(t * 1.6 + nodes[i].phase);
+      var rad = 1.1 + glow * 1.1 * s.intensity;
+      var alpha = 0.35 + glow * 0.5;
+      ctx.beginPath();
+      ctx.fillStyle = "rgba(" + rgbStr + "," + alpha.toFixed(3) + ")";
+      ctx.shadowColor = s.color;
+      ctx.shadowBlur = 4 + glow * 5 * s.intensity;
+      ctx.arc(p.x, p.y, rad, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    });
+
+    if (s.sparks && !reduced && Math.random() < 0.06 && edges.length) {
+      sparks.push({ e: edges[(Math.random() * edges.length) | 0], t: 0 });
+    }
+    sparks.forEach(function (sp) { sp.t += 0.045; });
+    sparks = sparks.filter(function (sp) { return sp.t < 1; });
+    sparks.forEach(function (sp) {
+      var pa = positions[sp.e.a], pb = positions[sp.e.b];
+      var x = pa.x + (pb.x - pa.x) * sp.t, y = pa.y + (pb.y - pa.y) * sp.t;
+      ctx.beginPath();
+      ctx.fillStyle = "#ffffff";
+      ctx.shadowColor = s.color;
+      ctx.shadowBlur = 8;
+      ctx.arc(x, y, 1.6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    });
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  setState("idle");
+})();
+</script>
+</body>
+</html>

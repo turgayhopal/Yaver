@@ -1,7 +1,12 @@
+Hepsini tek komuttan baslat (venv aktifken)
+python main.py
+
+Tek tek / ayri ayri (hata ararken, veya main.py'siz):
+
 Modeli Calistirma
 
 cd C:\yaver\llama
-llama-server.exe -m C:\yaver\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf --ctx-size 8128 --n-gpu-layers 99 --port 8080 --jinja
+llama-server.exe -m C:\yaver\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf --ctx-size 8128 --n-gpu-layers 99 --port 8080 --jinja --parallel 1 --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --cache-reuse 256
 
 Activate
 C:\yaver\venv\Scripts\activate

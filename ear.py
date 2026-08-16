@@ -320,7 +320,9 @@ def main():
                     continue
                 print("\n>> ses algilandi")
 
+            publish_status(client, "listening")
             audio = record_speech(threshold, pre_buffer)
+            publish_status(client, "idle")
             pre_buffer.clear()
             text = transcribe(whisper, audio)
 

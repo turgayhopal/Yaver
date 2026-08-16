@@ -40,6 +40,9 @@ STM32MP157D-DK1'in M4 çekirdeği ileride gerçek zamanlı donanım kontrolü
 mikrofon → [ear] → MQTT → [brain] → MQTT → [mouth] → hoparlör
                               ↕
                           [skills] → MQTT → fiziksel cihazlar (örn. Pico W)
+
+ear/brain/mouth üçü de yaver/status'a durumlarini yayinlar -> [face] bunu
+dinleyip masaustunun kösesinde saydam bir widget'ta gösterir (bkz. asagida).
 ```
 
 Modüller birbirinin varlığını bilmez, sadece MQTT konularını bilir. Bir modül
@@ -76,12 +79,20 @@ Bu şema projenin omurgası. Değiştirilecekse tüm modüller birlikte güncell
 
 `yaver/status` değerleri:
 - `ear` → `woke` : uyandırma kelimesi duyuldu, mouth onay çalsın
+- `ear` → `listening` : ses algılandı, aktif olarak kaydediliyor
+- `ear` → `idle` : kayıt bitti (transkripsiyon/brain'e devrediliyor)
+- `brain` → `thinking` : soru kuyruktan alındı, LLM'den cevap bekleniyor
+- `brain` → `done` : bu turun cevabı (ya da hatası) tamamlandı
 - `mouth` → `speaking` : hoparlör aktif, ear sussun
 - `mouth` → `ready` : onay cümlesi bitti, ear kayda başlayabilir
 - `mouth` → `done` : kuyruk `mouth.reply_gap_sec` boyunca boş kaldı (anlık
   boşluk yetmez - brain cümle cümle yayınlarken sıradaki cümle gecikebilir,
   erken "done" ear'ın mouth'un kendi sesini dinleyip geri besleme döngüsüne
   girmesine yol açar)
+
+`ear`/`brain`/`thinking`/`listening`/`idle` durumlarının tek tüketicisi
+`face.py` (masaüstü widget'ı) - ses/LLM hattına hiçbir etkisi yok, sadece
+dinler. `face.py` kapalıyken bu yayınlar hiçbir aboneye gitmez, zararsız.
 
 Araç (skill) konuları:
 
@@ -108,10 +119,17 @@ bölümünde tanımlı — bkz. yukarıdaki genel cihaz kayıt defteri açıklam
 ```
 C:\yaver\
 ├── config.yaml          TÜM ayarlar. Platforma özel her şey burada.
+├── main.py                tum surecleri (llama-server + skills/brain/mouth/ear/face)
+│                          tek komuttan baslatan launcher - her biri yine ayri
+│                          bir surec, dogrudan cagrilmiyorlar (bkz. Calistirma)
 ├── ear.py                mikrofon + uyandırma/tetik + konuşma tanıma
 ├── brain.py               LLM istemcisi + hafıza + cümle akışı + arac cagirma
 ├── mouth.py               seslendirme + çalma kuyruğu
 ├── skills.py              arac (tool) registry + fiziksel cihaz kontrolu
+├── face.py                masaustu widget'i - yaver/status'u dinleyip durumu
+│                          (bosta/dinliyor/dusunuyor/konusuyor) gosterir
+├── face/
+│   └── widget.html        widget'in gorseli (pywebview ile acilir)
 ├── find_microphone.py     yardımcı: ses cihazlarını listeler/test eder
 ├── memory.json            kalıcı bilgiler (otomatik oluşur)
 ├── history.json           son konuşma turları (otomatik oluşur)
@@ -127,13 +145,29 @@ C:\yaver\
 
 ## Çalıştırma
 
-Beş ayrı terminal, Python olanların hepsinde `venv` aktif:
+`venv` aktifken tek komut, tek terminal:
 
 ```bash
-# 1. LLM sunucusu (bkz. Commands.txt)
+python main.py
+```
+
+`main.py`, `config.yaml`'daki `launcher` bolumunu okuyup llama-server'i ve
+skills/brain/mouth/ear'i AYNI ANDA, her biri kendi ayri surecinde baslatir -
+modullerin birbirini tanimasi/dogrudan cagirmasi ilkesi bozulmaz (main.py
+sadece elle ayri terminallerde girilen komutlari tek yerden calistirir,
+iletisim yine sadece MQTT). Her surecin ciktisi `[isim]` etiketiyle tek
+konsolda birlesir. `Ctrl+C` hepsini kapatir.
+
+Tek bir modulu izole test etmek/hata aramak icin eskisi gibi ayri ayri da
+calistirilabilir (bkz. Commands.txt), `venv` aktif her terminalde:
+
+```bash
+# 1. LLM sunucusu (bkz. Commands.txt - bu bayraklar config.yaml -> launcher ile
+#    birebir ayni tutulmali, main.py da bunlari oradan okuyup calistiriyor)
 cd C:\yaver\llama
 llama-server.exe -m C:\yaver\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf ^
-  --ctx-size 8128 --n-gpu-layers 99 --port 8080 --jinja
+  --ctx-size 8128 --n-gpu-layers 99 --port 8080 --jinja --parallel 1 ^
+  --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --cache-reuse 256
 
 # 2, 3, 4, 5 (skills olmadan da her sey calisir, sadece arac cagirma devre disi kalir)
 python brain.py
@@ -158,6 +192,18 @@ CUDA 12.4 build'i — bu GPU'nun sürücüsü (CUDA 13.1'e kadar destekliyor) CU
 ("PTX compiled with unsupported toolchain" hatası verir). Build'i güncellersen
 GPU'nun hâlâ çalıştığını `llama-server.exe --list-devices` ile doğrula.
 
+`--parallel 1` bilinçli bir secim: llama-server varsayılan olarak 4 paralel
+slot (n_slots=4) acar, her biri kendi KV-cache'ini tutar. Yaver hep TEK ve
+sıralı bir konusma yürüttügü icin (aynı anda iki kullanici yok) 4 slot sadece
+zarar veriyor - sunucu yeni bir istegi rastgele/LRU ile bos bir slota
+yönlendirebiliyor, bu da sistem promptu + gecmisin o slotta hic önbellekte
+olmaması, yani TÜM baglamin (1000+ token) sıfırdan islenmesi anlamına
+geliyor (GTX 1660'ta Tensor Core olmadigi icin bu ~5 saniye sürebiliyor -
+yasanmis ve ölcülmüs bir gecikme kaynagi). `--parallel 1` ile her istek hep
+AYNI slotu kullanir, ortak önek önbellegi hicbir zaman kaybolmaz - sadece
+son eklenen mesaj islenir. Yan fayda: 4 yerine 1 slotluk KV-cache ayrılır,
+VRAM'de ear.py'nin Whisper modeliyle paylasilan GPU icin yer acilir.
+
 Tek modül test modları (MQTT gerektirmez, hata ararken kullan):
 
 ```bash
@@ -174,11 +220,12 @@ python find_microphone.py       # cihazları listele
 |---|---|---|
 | Uyandırma | openWakeWord, `hey_jarvis` modeli | özel "Yaver" modeli henüz eğitilmedi |
 | Konuşma tanıma | faster-whisper, `small` model | GPU/int8_float16, ~0.5 sn |
-| LLM | llama.cpp server (CUDA 12.4 build) + Qwen3-4B-Instruct-2507 Q4_K_M | OpenAI uyumlu API, port 8080, GPU'da ~45 tok/sn |
+| LLM | llama.cpp server (CUDA 12.4 build) + Qwen3-4B-Instruct-2507 Q4_K_M | OpenAI uyumlu API, port 8080, `--parallel 1` + kuantali KV-cache + flash-attn ile GPU'da ~55 tok/sn |
 | Seslendirme | Piper, `tr_TR-dfki-medium` | onay cümleleri açılışta önceden sentezlenir |
 | Mesajlaşma | Mosquitto (MQTT), 0.0.0.0:1883 | LAN'a açık (kimlik doğrulamasız, ev ağı) - fiziksel cihazlar da bağlanabilsin diye |
-| Araç çağırma | llama.cpp `tools` (OpenAI uyumlu) | `brain.py` karar turu stream'siz, asıl cevap stream'li (2 LLM çağrısı) |
+| Araç çağırma | llama.cpp `tools` (OpenAI uyumlu) | `brain.py`'de karar turu da stream'li (bkz. `stream_decision`) - arac gerekmezse ilk cumle hemen soylenir |
 | Gömülü kart | Raspberry Pi Pico W, MicroPython + `umqtt.simple` | `boards/pico_w/main.py`, ilk demo: dahili LED aç/kapat |
+| Masaüstü widget | `pywebview` (yerel HTML/CSS/JS penceresi) | `face.py`, saydam/her seyin ustunde/kosede - sadece `yaver/status` dinler |
 
 ## Kod konvansiyonları
 
@@ -195,10 +242,14 @@ python find_microphone.py       # cihazları listele
 - **Hata durumunda çök, kapan değil.** Bir bileşen açılmazsa daha basit bir
   varyanta düş (örn. GPU→CPU) ve nedenini ekrana yaz.
 - Bağımlılıklar: `paho-mqtt sounddevice numpy pyyaml openwakeword faster-whisper
-  piper-tts httpx`
+  piper-tts httpx pywebview mss`
 - Whisper'ın GPU'da çalışması için ek olarak `nvidia-cublas-cu12 nvidia-cudnn-cu12
   nvidia-cuda-runtime-cu12` kurulu olmalı (ear.py bunların DLL yollarını
   otomatik bulup PATH'e ekler).
+- `face.py`'nin `pywebview`'i Windows'ta gercek pencere saydamligi icin `gui="qt"`
+  ile baslatmasi gerekiyor (WinForms/WebView2 arka ucu saydamligi desteklemiyor -
+  bkz. face.py'deki yorum) - bu yuzden `pip install pywebview` yetmez,
+  `pip install pywebview[pyside6]` gerekir (PySide6 + QtPy'yi de kurar).
 - **`brain.py`'nin sistem promptu ve `question` metni turlar arası birebir
   sabit kalmalı** (saat, hava durumu gibi değişken içerik YOK). llama-server
   isteğin ortak önekini (system prompt + geçmiş) önbelleğe alıyor; içeriklerden
@@ -237,9 +288,10 @@ filtre olarak bu moda dönülür.
 ## Şu an çalışan / çalışmayan
 
 **Çalışıyor:** metin-içi tetik kelime ("yaver" cümlede geçince cevap verir),
-Türkçe tanıma (GPU'da, isabetli, ~0.5 sn), LLM cevabı (GPU'da, ~45 tok/sn),
+Türkçe tanıma (GPU'da, isabetli, ~0.5 sn), LLM cevabı (GPU'da, ~55 tok/sn),
 cümle cümle akışlı seslendirme, ağız konuşurken kulağın susması, kalıcı
-konuşma geçmişi, arac cagirma (Pico W LED demo uctan uca calisiyor).
+konuşma geçmişi, arac cagirma (Pico W LED demo uctan uca calisiyor), masaustu
+durum widget'i (`face.py` - bosta/dinliyor/dusunuyor/konusuyor).
 
 **Bilinen model tuhaflığı:** küçük 4B model bazen bir araci çağırmadan
 "yaptım" diye uydurabiliyor (özellikle ayni araç bir önceki turda başarıyla

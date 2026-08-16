@@ -2,11 +2,29 @@
 # Platforma ozel HER SEY burada. Pi'ye tasirken sadece bu dosyayi degistireceksin.
 
 mqtt:
-  server: localhost        # Pi'ye tasiyinca buraya PC'nin IP'sini yazacaksin
+  server: 127.0.0.1         # "localhost" degil - Windows'ta IPv6 (::1) once denenip zaman
+                              # asimina ugruyor, sonra IPv4'e dusuyor (bkz. brain.server ayni not).
+                              # Pi'ye tasiyinca buraya PC'nin IP'sini yazacaksin
   port: 1883
   topic_text: yaver/speech/text
   topic_reply: yaver/reply/text
   topic_status: yaver/status
+
+face:
+  # Masaustu widget'i (face.py) - yaver/status'u dinleyip kucuk, her seyin
+  # ustunde saydam bir pencerede sinirsel aktivite gosterir. Ana ses/LLM
+  # hattina dokunmaz, sadece MQTT dinler.
+  width: 168
+  height: 220
+  margin_right: 24   # ekranin sag kenarindan uzaklik (piksel)
+  margin_bottom: 48  # ekranin alt kenarindan uzaklik (piksel) - gorev cubugunu
+                      # atlamak icin, sadece screen.height kullanildigindan
+                      # (bkz. face.py) buraya tam gorev cubugu yuksekligini +
+                      # bir miktar bosluk dahil et - hala tam degilse artir/azalt
+  screen_index: 0    # birden fazla monitor varsa hangisine yerlesecek (0 = birincil)
+  backdrop_sample_sec: 2.0       # arka plan (masaustu) ne kadar surede bir orneklenip
+                                   # acik/koyu kontrast paketi arasinda gecis yapilsin
+  backdrop_light_threshold: 140  # 0-255 ortalama parlaklik - bunun ustu "light" sayilir
 
 skills:
   topic_request: yaver/skill/request   # brain -> skills: {"id","name","params"}
@@ -25,8 +43,47 @@ devices:
     label: "masadaki Pico W'nin dahili LED'i"  # LLM'e gosterilir, "hangi cihaz" ayrimini bununla yapar
     topic: yaver/device/pico_led_masa    # bu cihaz bu konuyu dinler, "on"/"off" payload'u bekler
 
+launcher:
+  # main.py'nin tek komuttan baslattigi surecler. Her biri hala AYRI bir
+  # isletim sistemi sureci - main.py sadece elle ayri terminallerde girilen
+  # komutlari tek yerden calistirir, modullerin birbirini tanimasi/dogrudan
+  # cagirmasi yok (iletisim yine sadece MQTT).
+  llama_server:
+    binary: C:/yaver/llama/llama-server.exe
+    model: C:/yaver/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
+    ctx_size: 8128
+    n_gpu_layers: 99
+    port: 8080
+    parallel: 1   # tek KV-cache slotu - bkz. Commands.txt/CLAUDE.md notu, onbellek hep sicak kalsin diye
+    # --cache-type-k/v q8_0: KV-cache'i 8-bit'e indirir. GTX 1660'ta uretim
+    # hizini sinirlayan sey Tensor Core degil (yok), bellek bant genisligi -
+    # KV-cache trafigini yariya indirmek token/sn'yi artirabilir (kucuk bir
+    # kalite riskiyle). --flash-attn on: varsayilan 'auto' bu eski (Turing)
+    # GPU icin kapali kalmis olabilir, acikca 'on' deneniyor. DENEYSEL - ise
+    # yaramazsa ikisini de kaldir (once --flash-attn, sonra cache-type).
+    #
+    # --cache-reuse 256: brain.py'nin history'si sabit boyutlu bir pencere
+    # (history_turns) - dolunca en eski tur dusup yenisi eklenir (FIFO).
+    # Pencere kaydiginda onceki istekle ORTAK ONEK sadece sistem promptunda
+    # kaliyor, geri kalan tum baglam (900-1400 token, ozellikle arac cagrisi
+    # turlari agir) SIFIRDAN islenip yaniti yavaslatiyordu (yasanmis ve
+    # olculmus bir gecikme - "artik 1 sn altinda degil" sikayeti). Bu bayrak
+    # KV-shifting ile kaymis onbellegi de yeniden kullanmayi dener.
+    extra_args: [
+      "--jinja", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
+      "--flash-attn", "on", "--cache-reuse", "256",
+    ]
+  modules:          # main.py bunlari sirayla baslatir (ayni python yorumlayicisiyla, sys.executable)
+    - skills.py
+    - brain.py
+    - mouth.py
+    - ear.py
+    - face.py
+
 brain:
-  server: http://localhost:8080
+  server: http://127.0.0.1:8080   # "localhost" degil bilerek - Windows'ta IPv6 (::1) once
+                                    # denenip zaman asimina ugruyor, sonra IPv4'e dusuyor -
+                                    # bu her istekte ~2 sn sabit gecikme ekliyor (olculdu)
   history_turns: 4         # kac konusma turu hatirlansin. Kucuk model uzun gecmiste
                             # kendi kaliplarini (dolgu cumleleri) tekrarlamaya basliyor,
                             # bu yuzden dusuk tutuluyor - sadece kisa vadeli takip
@@ -47,11 +104,21 @@ brain:
       araci gercekten cagirarak yapabilirsin. Araci cagirmadan "yaptim",
       "acildi", "sondu" gibi bir seyi basardigini ASLA soyleme - onceki
       konusmada bir arac cagirmis olman, simdiki istek icin de cagirmana
-      gerek olmadigi anlamina gelmez, her istek icin ayri ayri cagir.
+      gerek olmadigi anlamina gelmez, her istek icin ayri ayri cagir. Asagidaki
+      konusma gecmisinde bir onceki LED isteginde arac cagirmadan cevap
+      verilmis gibi gorunse bile SEN yine de gercekten cagir - gecmisi
+      TAKLIT ETME, bu bir hataydi.
     - Bir aracin "hangi cihaz" secenegi (device gibi) varsa ve kullanici
       hangisini kastettigini belirtmediyse ya da net degilse: ASLA tahmin
       etme, rastgele bir cihaz secme, veya aracı hic cagirmadan basardigini
       soyleme - bunun yerine kullaniciya hangi cihazi kastettigini sor.
+    - Kendinden bahsederken HER ZAMAN birinci sahis kullan: "Ben Yaver'im",
+      "Adim Yaver". ASLA "sen Yaver" ya da "ben sen Yaver" gibi ikinci ve
+      birinci sahsi karistiran bozuk bir cumle kurma.
+    - Bir aracı cagirip bir islemi tamamladiktan sonra (orn. LED actin/sondun)
+      SADECE ne yaptigini kisaca soyle. "iyi gunler dilerim", "baska bir sey
+      var mi", "yardimci olmaktan mutluluk duyarim" gibi otomatik nezaket
+      kapanislari EKLEME - kullanici bunu istemedi, gereksiz uzatiyor.
 
 mouth:
   voice_model: C:/yaver/voices/tr_TR-dfki-medium.onnx
@@ -81,7 +148,7 @@ wakeword:
 
 recording:
   silence_multiplier: 2.5   # ortam gurultusunun kac kati "konusma" sayilsin
-  silence_sec: 1.2          # bu kadar sessizlik olunca kayit biter
+  silence_sec: 0.8          # bu kadar sessizlik olunca kayit biter
   max_sec: 15
   min_sec: 0.7               # bundan kisa kayitlari coplugu at
 
