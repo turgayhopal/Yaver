@@ -4,6 +4,8 @@ Calistirma (proje kokunden, venv aktifken):
     python -m unittest discover tests
 """
 
+import contextlib
+import io
 import sys
 import unittest
 from pathlib import Path
@@ -94,7 +96,9 @@ class PayloadTest(unittest.TestCase):
         @common.guard
         def broken(*args):
             raise ValueError("bozuk")
-        self.assertIsNone(broken(None, None, None))
+        # guard hatayi bilerek yazdirir - test ciktisini kirletmesin
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(broken(None, None, None))
 
 
 class SkillsTest(unittest.TestCase):

@@ -216,8 +216,8 @@ Windows notu: Wi-Fi ağı "Public" sınıflandırılırsa Private-only kural uyg
   geçmiş) önbellekte tutuyor - ölçüldü: aynı 881 token'lık istekte istem
   işleme 4192 ms → 23 ms. Bu yüzden sistem promptu ve geçmiş turlar arası
   sabit kalmalı (bkz. Kod konvansiyonları).
-- **VRAM:** `qwen3:4b` + 8192 bağlam GPU'da 3,9 GB tuttu; Whisper `small` ile
-  aynı 6 GB'lık GPU'yu paylaşıyor.
+- **VRAM:** ölçüldü - `qwen3:4b-instruct` (4096 bağlam) + Whisper `small`
+  (int8_float16) birlikte 4,2 / 6,1 GB. Whisper GPU'da cümle başına ~0,3 sn.
 - **llama.cpp kullanılacaksa** (Windows'ta böyleydi): `--parallel 1` şart -
   varsayılan 4 slot isteği önbelleği olmayan bir slota yönlendirip tüm
   bağlamı (1000+ token) sıfırdan işletiyordu (GTX 1660'ta ~5 sn). Ayrıca
@@ -329,6 +329,13 @@ Türkçe tanıma (GPU'da, isabetli, ~0.5 sn), LLM cevabı (GPU'da, ~55 tok/sn),
 cümle cümle akışlı seslendirme, ağız konuşurken kulağın susması, kalıcı
 konuşma geçmişi, arac cagirma (Pico W LED demo uctan uca calisiyor), masaustu
 durum widget'i (`face.py` - bosta/dinliyor/dusunuyor/konusuyor).
+
+**Linux'ta doğrulanan (Fedora, Ollama):** brain + skills uçtan uca (gerçek
+Mosquitto + Ollama ile soru-cevap, LED aracı, bozuk mesajlar, skills kapanınca
+araçların kalkması), Whisper GPU'da (Piper sesiyle beslenerek), Piper sentezi,
+widget'ın açılması, birim testleri. **Henüz doğrulanmadı:** gerçek mikrofonla
+tam zincir (`python main.py`), hoparlörden duyulan ses, widget'ın Wayland'de
+konumu/her şeyin üstünde kalması.
 
 **Bilinen model tuhaflığı:** küçük 4B model bazen bir araci çağırmadan
 "yaptım" diye uydurabiliyor (özellikle ayni araç bir önceki turda başarıyla
