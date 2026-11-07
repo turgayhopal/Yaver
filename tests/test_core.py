@@ -113,6 +113,11 @@ class PayloadTest(unittest.TestCase):
         for payload in [b"123", b"[1, 2]", b"not json", b"\xff\xfe", b""]:
             self.assertIsNone(common.parse_payload(self.msg(payload)), payload)
 
+    def test_strip_emoji(self):
+        self.assertEqual(common.strip_emoji("Evet, ben Yaver'im. \U0001F60A"), "Evet, ben Yaver'im.")
+        self.assertEqual(common.strip_emoji("\U0001F60A"), "")
+        self.assertEqual(common.strip_emoji("Işık açık, güneş doğdu."), "Işık açık, güneş doğdu.")
+
     def test_text_field(self):
         self.assertEqual(common.text_field({"text": "  merhaba "}), "merhaba")
         self.assertEqual(common.text_field({"text": None}), "")

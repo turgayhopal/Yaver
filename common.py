@@ -9,6 +9,7 @@ hicbir modulun varligini bilmez. Moduller arasi iletisim yine sadece MQTT.
 
 import functools
 import json
+import re
 import traceback
 from pathlib import Path
 
@@ -72,6 +73,25 @@ def text_field(packet, key="text"):
     degilse bos string."""
     value = packet.get(key)
     return value.strip() if isinstance(value, str) else ""
+
+
+# LLM sistem promptunda emoji kullanma dense de uretebiliyor (olculdu: gecmiste
+# emoji varken 15 cevabin 15'inde). Piper bunlari tuhaf okumaya calisiyor.
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U00002300-\U000023FF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U0000FE0F\U0000200D"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def strip_emoji(text):
+    text = EMOJI_PATTERN.sub("", text)
+    return re.sub(r" {2,}", " ", text).strip()
 
 
 def guard(callback):

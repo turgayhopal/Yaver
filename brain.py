@@ -25,7 +25,8 @@ from collections import deque
 
 import httpx
 
-from common import ROOT, guard, load_config, mqtt_client, mqtt_connect, parse_payload, text_field
+from common import (ROOT, guard, load_config, mqtt_client, mqtt_connect, parse_payload,
+                    strip_emoji, text_field)
 
 # LLM bazen (nadiren) sistem promptunun yasagina ragmen emoji uretiyor (bkz.
 # "Bilinen model tuhafligi"). Windows konsolu varsayilan kod sayfasi (orn.
@@ -93,6 +94,10 @@ def read_history():
         return
     turn = []
     for m in flat:
+        # Eski kayitlardaki emoji de temizlensin - gecmiste gordugu emojiyi
+        # model her cevapta taklit ediyordu (bkz. ask()).
+        if m.get("role") == "assistant" and isinstance(m.get("content"), str):
+            m["content"] = strip_emoji(m["content"])
         if m.get("role") == "user" and turn:
             add_turn(turn)
             turn = []
@@ -390,6 +395,17 @@ def ask(question, on_sentence=None):
     """
     messages, tools_enabled = build_messages(question)
 
+    # Emoji ne seslendirilsin ne gecmise yazilsin: gecmiste emoji goren model
+    # her cevapta tekrarliyordu (olculdu: 15 cevabin 15'i). Sadece emojiden
+    # olusan cumle (orn. tek bir gulen yuz) hic yayinlanmaz.
+    if on_sentence:
+        raw_on_sentence = on_sentence
+
+        def on_sentence(sentence):
+            sentence = strip_emoji(sentence)
+            if sentence:
+                raw_on_sentence(sentence)
+
     full_text = None
     tool_messages = []  # bu turda kullanildiysa: [decision, tool_sonucu] - gecmise de yazilir
 
@@ -424,6 +440,10 @@ def ask(question, on_sentence=None):
     if full_text is None:
         full_text = stream_reply(messages, on_sentence)
 
+    full_text = strip_emoji(full_text)
+    for m in tool_messages:
+        if m.get("role") == "assistant" and m.get("content"):
+            m["content"] = strip_emoji(m["content"])
     # Tum tur (soru + varsa arac cagrisi/sonucu + cevap) TEK GRUP olarak eklenir -
     # boylece maxlen asilinca grup butun halinde dusurulur, ortadan kesilmez.
     turn = [{"role": "user", "content": question}]

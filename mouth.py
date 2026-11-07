@@ -12,7 +12,6 @@ import io
 import json
 import queue
 import random
-import re
 import sys
 import threading
 import wave
@@ -20,7 +19,8 @@ import wave
 import numpy as np
 import sounddevice as sd
 
-from common import guard, load_config, mqtt_client, mqtt_connect, parse_payload, resolve_path, text_field
+from common import (guard, load_config, mqtt_client, mqtt_connect, parse_payload, resolve_path,
+                    strip_emoji, text_field)
 
 CONFIG = load_config()
 MOUTH = CONFIG["mouth"]
@@ -42,25 +42,6 @@ def load_voice():
         )
     print(f"Ses modeli yukleniyor: {path.name}")
     return PiperVoice.load(str(path))
-
-
-# LLM sistem promptunda emoji kullanma diyor ama bazen yine de sizdiriyor,
-# Piper bunlari tuhaf sekilde okumaya calisiyor - seslendirmeden once temizle.
-EMOJI_PATTERN = re.compile(
-    "["
-    "\U0001F300-\U0001FAFF"
-    "\U00002600-\U000027BF"
-    "\U00002300-\U000023FF"
-    "\U0001F1E6-\U0001F1FF"
-    "\U0000FE0F\U0000200D"
-    "]+",
-    flags=re.UNICODE,
-)
-
-
-def strip_emoji(text):
-    text = EMOJI_PATTERN.sub("", text)
-    return re.sub(r" {2,}", " ", text).strip()
 
 
 def synthesize(voice, text):
