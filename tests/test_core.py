@@ -115,6 +115,16 @@ class SkillsTest(unittest.TestCase):
         self.assertEqual(set(schema["enum"]), set(skills.devices_by_type("led")))
 
 
+class SharedHelpersTest(unittest.TestCase):
+    def test_modules_do_not_shadow_common_helpers(self):
+        # ear.py'nin kendi mqtt_connect()'i common'dakini ezmisti, ear acilista
+        # TypeError ile coktu (yasanmis) - ayni isim tekrar tanimlanmasin.
+        for module in (brain, ear, skills):
+            for name in ("mqtt_client", "mqtt_connect", "parse_payload", "guard", "load_config"):
+                if hasattr(module, name):
+                    self.assertIs(getattr(module, name), getattr(common, name), f"{module.__name__}.{name}")
+
+
 class PathTest(unittest.TestCase):
     def test_relative_paths_resolve_to_project_root(self):
         self.assertEqual(common.resolve_path("voices/x.onnx"), common.ROOT / "voices" / "x.onnx")

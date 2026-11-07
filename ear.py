@@ -38,7 +38,7 @@ ack_done = threading.Event()     # "efendim" bitti, kayda baslayabiliriz
 
 
 # --------------------------------------------------------------------------- MQTT
-def mqtt_connect():
+def start_mqtt():
     if SILENT_MODE:
         return None
     client = mqtt_client("yaver-ear")
@@ -321,7 +321,7 @@ def transcribe(whisper, audio):
 def main():
     whisper = load_whisper()
     oww = load_wakeword() if CONFIG["wakeword"]["enabled"] else None
-    client = mqtt_connect()
+    client = start_mqtt()
 
     stream = sd.InputStream(
         device=CONFIG["audio"]["input_device"],
