@@ -50,9 +50,9 @@ CHAT_URL = f"{LOCAL['server']}/v1/chat/completions"
 MEMORY_FILE = ROOT / "memory.json"    # kalici bilgiler (ad, tercihler)
 HISTORY_FILE = ROOT / "history.json"  # son konusma turlari
 
-history = deque(maxlen=BRAIN["history_turns"])  # her eleman bir TURUN mesaj listesi
-# (tek mesaj degil) - boylece bir arac turu (4 mesaj: soru, arac cagrisi, arac
-# sonucu, cevap) sinir asilinca ortadan kesilip yetim bir "tool" mesaji birakmaz.
+history = deque()  # her eleman bir TURUN mesaj listesi (tek mesaj degil) - boylece
+# bir arac turu (4 mesaj: soru, arac cagrisi, arac sonucu, cevap) sinir asilinca
+# ortadan kesilip yetim bir "tool" mesaji birakmaz. Sinir: bkz. add_turn().
 
 client_ref = [None]        # MQTT istemcisi - --ask modunda None kalir, arac cagirma atlanir
 available_tools = []       # skills.py'den ogrenilen guncel arac (tool) listesi
@@ -69,6 +69,21 @@ def read_memory():
         return {}
 
 
+def add_turn(turn):
+    """Gecmise bir tur ekler. Sinir (history_turns) asilinca en eski turlar
+    TEK TEK degil, BLOK halinde atilir: son history_trim_to tur kalir.
+
+    Neden: LLM sunucusu ortak oneki (sistem promptu + gecmis) onbellekte
+    tutuyor. Her turda en eski tur atilinca onek sistem promptundan hemen
+    sonra degisiyor, gecmisin tamami HER SORUDA yeniden isleniyordu - olculdu:
+    6. turdan itibaren ilk cumle 0,5 sn'den 1,15 sn'ye cikti. Blok atmayla
+    onbellek sadece birkac turda bir, kisa bir gecmis icin yenilenir."""
+    history.append(turn)
+    if len(history) > BRAIN["history_turns"]:
+        while len(history) > BRAIN["history_trim_to"]:
+            history.popleft()
+
+
 def read_history():
     if not HISTORY_FILE.exists():
         return
@@ -79,11 +94,11 @@ def read_history():
     turn = []
     for m in flat:
         if m.get("role") == "user" and turn:
-            history.append(turn)
+            add_turn(turn)
             turn = []
         turn.append(m)
     if turn:
-        history.append(turn)
+        add_turn(turn)
 
 
 def write_history():
@@ -349,10 +364,14 @@ def warm_up():
     onbellegine alir - ilk gercek soru soguk yuklemeyi (~12 sn, olculdu)
     beklemesin. Tek token uretir; cevap kullanilmaz, gecmise yazilmaz.
     Basarisiz olursa sadece yazdirir: LLM kapali olsa da brain calismali."""
-    messages, _ = build_messages(".")
+    messages, tools_enabled = build_messages(".")
+    # Araclar gercek sorudaki gibi gonderilmeli: sunucu arac listesini
+    # istemin icine (sistem kismina) yaziyor - araclarsiz isinma baska bir
+    # onek onbellege alir, ilk gercek soru yine bastan islenirdi (olculdu).
+    tools = {"tools": list(available_tools)} if tools_enabled else {}
     t0 = time.time()
     try:
-        r = http_client.post(CHAT_URL, json=request_body(messages, max_tokens=1, stream=False))
+        r = http_client.post(CHAT_URL, json=request_body(messages, max_tokens=1, stream=False, **tools))
         r.raise_for_status()
         print(f"  LLM isindi ({time.time() - t0:.1f} sn)")
     except httpx.HTTPError as error:
@@ -410,7 +429,7 @@ def ask(question, on_sentence=None):
     turn = [{"role": "user", "content": question}]
     turn.extend(tool_messages)  # arac gercekten cagirildiysa bunu da hatirla,
     turn.append({"role": "assistant", "content": full_text})  # yoksa model sadece
-    history.append(turn)  # onceki onay cumlesini taklit edip araci atlamaya basliyor
+    add_turn(turn)  # onceki onay cumlesini taklit edip araci atlamaya basliyor
     write_history()
     return full_text
 
@@ -421,6 +440,8 @@ def main():
     client_ref[0] = client
 
     question_queue = queue.Queue()
+    WARM_UP = object()  # kuyrukta "soru degil, onbellegi isit" isareti
+    tools_known = threading.Event()  # skills'in arac listesi (ya da yoklugu) ogrenildi
 
     def publish_sentence(sentence):
         print(f"  -> {sentence}")
@@ -440,11 +461,17 @@ def main():
     def worker():
         # Isitma burada, kuyruktan once: MQTT ag thread'ini bloklamaz, ama
         # gelen ilk soru isinma bitene kadar kuyrukta bekler (zaten LLM'i
-        # bekleyecekti).
+        # bekleyecekti). Once skills'in arac listesini (retained, baglanir
+        # baglanmaz gelir) bekle: araclarsiz isinma yanlis istemi onbellege
+        # alirdi. skills kapaliysa liste hic gelmez, sure dolunca isinilir.
         if LOCAL.get("warm_up"):
+            tools_known.wait(CONFIG["skills"]["list_wait_sec"])
             warm_up()
         while True:
             question = question_queue.get()
+            if question is WARM_UP:
+                warm_up()
+                continue
             print(f'\nSORU: "{question}"')
             publish_status("thinking")
             try:
@@ -469,18 +496,28 @@ def main():
             # LLM'e artik tanitilmasin, yoksa model olmayan bir araci cagirip
             # zaman asimina dusuyordu.
             if not msg.payload:
-                available_tools.clear()
-                print("  araclar kaldirildi (skills kapali)")
-                return
-            try:
-                tools = json.loads(msg.payload.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                return
-            if not isinstance(tools, list):
-                return
+                tools = []
+            else:
+                try:
+                    tools = json.loads(msg.payload.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return
+                if not isinstance(tools, list):
+                    return
+            changed = tools != available_tools
             available_tools[:] = tools
-            names = [t["function"]["name"] for t in available_tools]
-            print(f"  {len(available_tools)} arac ogrenildi: {', '.join(names)}")
+            if tools:
+                names = [t["function"]["name"] for t in available_tools]
+                print(f"  {len(available_tools)} arac ogrenildi: {', '.join(names)}")
+            else:
+                print("  arac yok (skills kapali)")
+            # Arac listesi istemin parcasi: degisince onbellek de gecersiz.
+            # Acilistaki ilk liste worker'in kendi isinmasini tetikler;
+            # sonraki degisikliklerde yeniden isit (ilk soru beklemesin).
+            if not tools_known.is_set():
+                tools_known.set()
+            elif changed and LOCAL.get("warm_up"):
+                question_queue.put(WARM_UP)
             return
 
         packet = parse_payload(msg)

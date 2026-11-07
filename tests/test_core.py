@@ -46,6 +46,33 @@ class SplitSentenceTest(unittest.TestCase):
         self.assertEqual(rest, "Lamba şu anda açık dur")
 
 
+class HistoryTrimTest(unittest.TestCase):
+    def setUp(self):
+        brain.history.clear()
+
+    def tearDown(self):
+        brain.history.clear()
+
+    def test_history_is_trimmed_in_blocks(self):
+        limit, keep = brain.BRAIN["history_turns"], brain.BRAIN["history_trim_to"]
+        for i in range(limit):
+            brain.add_turn([{"role": "user", "content": str(i)}])
+        self.assertEqual(len(brain.history), limit)       # sinira kadar hic atilmaz
+        brain.add_turn([{"role": "user", "content": "yeni"}])
+        self.assertEqual(len(brain.history), keep)        # asilinca tek seferde keep'e iner
+        self.assertEqual(brain.history[-1][0]["content"], "yeni")
+
+    def test_tool_turn_stays_whole(self):
+        tool_turn = [{"role": "user", "content": "ledi yak"},
+                     {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
+                     {"role": "tool", "tool_call_id": "1", "content": "{}"},
+                     {"role": "assistant", "content": "Yaktim."}]
+        for _ in range(brain.BRAIN["history_turns"] + 1):
+            brain.add_turn(list(tool_turn))
+        for turn in brain.history:
+            self.assertEqual(len(turn), 4)
+
+
 class RequestBodyTest(unittest.TestCase):
     def test_body_has_model_and_fields(self):
         body = brain.request_body([{"role": "user", "content": "x"}], stream=True)

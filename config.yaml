@@ -35,6 +35,7 @@ skills:
   topic_result: yaver/skill/result     # skills -> brain: {"id","name","status","data"}
   topic_list: yaver/skill/list         # skills -> brain: mevcut araclarin listesi (retained)
   timeout_sec: 5.0                     # bir arac cagrisinin sonucu icin en fazla bekleme
+  list_wait_sec: 2.0                   # brain acilista LLM'i isitmadan once arac listesini en fazla bu kadar bekler
 
 devices:
   # Genel cihaz kayit defteri - burada tanimli her cihaz, ayni "type"a sahip
@@ -94,6 +95,9 @@ brain:
                             # kendi kaliplarini (dolgu cumleleri) tekrarlamaya basliyor,
                             # bu yuzden dusuk tutuluyor - sadece kisa vadeli takip
                             # sorularini ("bir tane daha oner") hatirlamasi yeterli.
+  history_trim_to: 2        # sinir asilinca gecmis bu kadar tura indirilir (tek tek kaydirilmaz).
+                            # Her turda kaydirmak LLM onbellegini her soruda bozup gecmisin
+                            # tamamini yeniden isletiyordu (olculdu: +0,6 sn/soru). Bkz. add_turn()
   temperature: 0.4
   max_tokens: 160           # sesli cevap kisa olmali
   stream: true              # cumle biter bitmez seslendir (gecikmeyi yariya indirir)
@@ -154,7 +158,7 @@ mouth:
                              # bu kadar sure yeni cumle gelmezse "done" (bitti) yayinla
 
 audio:
-  input_device: null        # null = sistemin varsayilan girisi. find_microphone.py ile numara/ad ogren;
+  input_device: 0           # null = sistemin varsayilan girisi. find_microphone.py ile numara/ad ogren;
                             # numara makineden makineye degisir, ad parcasi (orn. "USB") daha kalicidir
   sample_rate: 16000        # openWakeWord ve Whisper 16 kHz ister, degistirme
   block_size: 1280          # 80 ms. openWakeWord bu boyutu bekler, degistirme

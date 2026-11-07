@@ -297,8 +297,14 @@ python find_microphone.py       # cihazları listele
   `.gitignore`'da; sadece `secrets_example.py` (placeholder) takip edilir.
   Yeni bir kart/entegrasyon kimlik bilgisi gerektirirse aynı deseni kullan:
   `*_example.py` commit edilir, gerçek dosya gitignore'a eklenir.
-- **`brain.py`'nin `history`'si tur bazında gruplanır** (tek tek mesaj değil,
-  bkz. `deque(maxlen=BRAIN["history_turns"])`) — bir arac turu 4 mesajdan
+- **`brain.py`'nin `history`'si sınır aşılınca BLOK halinde kırpılır** (bkz.
+  `add_turn()`, `brain.history_trim_to`): her turda en eski turu atmak LLM
+  önbelleğini her soruda bozup geçmişin tamamını yeniden işletiyordu (ölçüldü:
+  6. turdan itibaren ilk cümle 0,5 → 1,15 sn). Aynı sebeple brain'in açılış
+  ısınması araç listesini bekler ve araçlarla birlikte gönderilir - araçsız
+  ısınma başka bir öneki önbelleğe alıyordu (ilk soru 1,5 sn → 0,4 sn).
+- **`brain.py`'nin `history`'si tur bazında gruplanır** (tek tek mesaj
+  değil) — bir arac turu 4 mesajdan
   (soru, arac çağrısı, arac sonucu, cevap) oluşur, sınır dolunca bir turun
   ortadan kesilip bozuk bir mesaj dizisi (yetim `"tool"` mesajı) bırakmaması
   için. Aracın gerçekten çağrıldığını gösteren mesajlar da geçmişe yazılır -
