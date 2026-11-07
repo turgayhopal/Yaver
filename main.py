@@ -1,12 +1,15 @@
 """Yaver - main launcher (baslatici).
 
-llama-server + skills/brain/mouth/ear'i TEK komuttan baslatir - her biri hala
-kendi AYRI isletim sistemi surecinde calisir, aralarinda hicbir dogrudan
+config.yaml -> launcher.modules'deki modulleri TEK komuttan baslatir - her biri
+hala kendi AYRI isletim sistemi surecinde calisir, aralarinda hicbir dogrudan
 fonksiyon cagrisi yok (bkz. CLAUDE.md "Yapilmayacaklar"). main.py sadece
 elle ayri terminallerde girilen komutlari tek yerden calistirip loglarini
-[isim] etiketiyle tek konsolda birlestirir. Modullerin bagimsizligi bozulmaz:
-Ctrl+C ile main.py kapanirsa hepsini kapatir, ama tek bir modulu ayri ayri
-`python brain.py` ile calistirmak yine de calisir (bkz. Commands.txt).
+[isim] etiketiyle tek konsolda birlestirir. Tek bir modulu ayri ayri
+`python brain.py` ile calistirmak yine de calisir.
+
+LLM sunucusunu (Ollama, llama.cpp vb.) ve MQTT broker'ini BASLATMAZ - ikisi
+de arka planda zaten calisan servisler olarak beklenir. main.py acilista
+sadece ulasilabilir olduklarini kontrol edip net bir uyari verir.
 
 Kullanim:
     python main.py
@@ -14,28 +17,64 @@ Kullanim:
 """
 
 import os
+import socket
 import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
 
-import yaml
+from common import ROOT, load_config
 
-# Alt surecler artik UTF-8 yayinliyor (bkz. start()'taki PYTHONIOENCODING),
-# ama main.py'nin KENDI stdout'u hala Windows konsol kod sayfasini (orn.
-# cp1254) kullaniyordu - relay_output() bir emoji iceren satiri print
-# ederken UnicodeEncodeError firlatip o modulun log thread'ini sessizce
-# olduruyordu (yasanmis: brain/mouth loglari emoji gelince kayboldu, ama
-# alt surecler kendileri calismaya devam etti). Ayni cozum: bkz. brain.py.
+# Alt surecler UTF-8 yayinliyor (bkz. start()'taki PYTHONIOENCODING), ama
+# main.py'nin KENDI stdout'u konsolun kod sayfasini (orn. Windows cp1254)
+# kullanabilir - relay_output() emoji iceren bir satiri print ederken
+# UnicodeEncodeError firlatip o modulun log thread'ini sessizce olduruyordu
+# (yasanmis). Ayni cozum: bkz. brain.py.
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-ROOT = Path(__file__).parent
-CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+CONFIG = load_config()
 LAUNCHER = CONFIG["launcher"]
 
 processes = []   # [(isim, Popen)]
 reported_dead = set()
+
+
+def check_broker():
+    """Broker kapaliysa hicbir modul baglanamaz - baslatmanin anlami yok."""
+    server, port = CONFIG["mqtt"]["server"], CONFIG["mqtt"]["port"]
+    try:
+        with socket.create_connection((server, port), timeout=LAUNCHER["check_timeout_sec"]):
+            pass
+    except OSError as error:
+        raise SystemExit(
+            f"[main] MQTT broker'a ulasilamiyor ({server}:{port}): {error}\n"
+            "       Mosquitto calisiyor mu? (orn. 'systemctl start mosquitto' ya da 'mosquitto -v')"
+        )
+    print(f"[main] MQTT broker hazir: {server}:{port}")
+
+
+def check_llm():
+    """LLM kapali olsa bile diger moduller calisir (brain hata cumlesi
+    soyler) - bu yuzden sadece uyarir, durdurmaz."""
+    import httpx
+
+    llm = CONFIG["llm"]
+    if llm["provider"] != "local":
+        return
+    local = llm["local"]
+    try:
+        r = httpx.get(f"{local['server']}/v1/models", timeout=LAUNCHER["check_timeout_sec"])
+        r.raise_for_status()
+        models = [m.get("id") for m in r.json().get("data", [])]
+    except Exception as error:
+        print(f"[main] UYARI: LLM sunucusuna ulasilamiyor ({local['server']}): {error}")
+        print("[main]        Yaver duyar ama cevap veremez. LLM sunucusunu (orn. Ollama) baslat.")
+        return
+    if local["model"] not in models:
+        print(f"[main] UYARI: '{local['model']}' modeli sunucuda yok. Mevcut: {', '.join(models) or '-'}")
+        print(f"[main]        Ollama icin: ollama pull {local['model']}")
+        return
+    print(f"[main] LLM hazir: {local['model']} @ {local['server']}")
 
 
 def relay_output(name, proc):
@@ -44,20 +83,18 @@ def relay_output(name, proc):
         print(f"[{name}] {line.rstrip()}")
 
 
-def start(name, cmd, cwd):
-    # PYTHONIOENCODING: alt surecin kendi stdout'u UTF-8 olsun - Windows
-    # konsol kod sayfasi (orn. cp1254) LLM'in urettigi emoji gibi karakterleri
-    # yazdiramayip surecin coktugu yasandi (bkz. brain.py stdout.reconfigure
-    # yorumu) - burada TUM alt surecler icin ayni korumayi merkezi olarak saglar.
+def start(name, cmd):
+    # PYTHONIOENCODING: alt surecin kendi stdout'u UTF-8 olsun - konsol kod
+    # sayfasi LLM'in urettigi emoji gibi karakterleri yazdiramayip surecin
+    # coktugu yasandi (bkz. brain.py stdout.reconfigure yorumu).
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     # PYTHONUNBUFFERED: stdout bir pipe'a (main.py'ye) yonlendirildiginde
-    # Python'un kendisi bunu bir TTY sanmayip TAMAMEN arabelleğe alıyor -
-    # yani alt surecin ciktisi kendi arabellegi dolana/surec kapanana kadar
-    # buraya hic akmiyor (skills.py'yi tek basima test ederken de yasandi).
+    # Python ciktiyi tamamen arabellege aliyor - alt surecin loglari arabellek
+    # dolana/surec kapanana kadar buraya hic akmiyordu (yasanmis).
     env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(
-        cmd, cwd=cwd, env=env,
+        cmd, cwd=str(ROOT), env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace", bufsize=1,
     )
@@ -72,34 +109,21 @@ def stop_all():
         proc.terminate()
     for name, proc in processes:
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=LAUNCHER["stop_timeout_sec"])
         except subprocess.TimeoutExpired:
             proc.kill()
     print("[main] hepsi kapandi.")
 
 
 def main():
-    llm = LAUNCHER["llama_server"]
-    llm_cmd = [
-        llm["binary"], "-m", llm["model"],
-        "--ctx-size", str(llm["ctx_size"]),
-        "--n-gpu-layers", str(llm["n_gpu_layers"]),
-        "--port", str(llm["port"]),
-        "--parallel", str(llm["parallel"]),
-        *llm.get("extra_args", []),
-    ]
-    # try/finally BASLATMA asamasini da (llama-server modelini yuklerken
-    # birkaç saniye surebiliyor) kapsar - onceden sadece asagidaki bekleme
-    # dongusu Ctrl+C yakaliyordu, baslangicta kesilirse (orn. kullanici
-    # sabirsizlanip erken Ctrl+C basarsa, ya da bir start() cagrisi hata
-    # verirse) stop_all() hic calismadan siddetle baslatilmis surecler
-    # (llama-server.exe dahil) arkada calisir kaliyordu (yasanmis sorun,
-    # docstring'deki "Ctrl+C hepsini kapatir" sozunu bozuyordu).
+    check_broker()
+    check_llm()
+    # try/finally BASLATMA asamasini da kapsar - baslatma sirasinda Ctrl+C
+    # basilirsa ya da bir start() hata verirse, o ana kadar baslatilmis
+    # surecler arkada calisir kalmasin (yasanmis sorun).
     try:
-        start("llama", llm_cmd, cwd=str(Path(llm["binary"]).parent))
-
         for module in LAUNCHER["modules"]:
-            start(module.replace(".py", ""), [sys.executable, module], cwd=str(ROOT))
+            start(module.replace(".py", ""), [sys.executable, module])
 
         print("[main] hepsi baslatildi. Kapatmak icin Ctrl+C.")
         while True:

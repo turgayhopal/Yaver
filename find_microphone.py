@@ -10,7 +10,9 @@ import sys
 import numpy as np
 import sounddevice as sd
 
-SAMPLE_RATE = 16000
+from common import load_config
+
+AUDIO = load_config()["audio"]
 
 
 def list_devices():
@@ -38,10 +40,10 @@ def test_device(device):
 
     with sd.InputStream(
         device=device,
-        samplerate=SAMPLE_RATE,
+        samplerate=AUDIO["sample_rate"],
         channels=1,
         dtype="int16",
-        blocksize=1280,
+        blocksize=AUDIO["block_size"],
         callback=callback,
     ):
         sd.sleep(5000)
@@ -50,7 +52,7 @@ def test_device(device):
     if peak < 200:
         print("Cok dusuk. Yanlis cihaz olabilir veya mikrofon sessizde.")
     elif peak > 20000:
-        print("Cok yuksek, kirpma riski var. Windows ses ayarlarindan kazanci dusur.")
+        print("Cok yuksek, kirpma riski var. Isletim sisteminin ses ayarlarindan kazanci dusur.")
     else:
         print("Seviye iyi. config.yaml icinde  audio.input_device: %d  yaz." % device)
 

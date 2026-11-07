@@ -1,7 +1,7 @@
 """Yaver - Pico W LED demo (cihaz kimligi: pico_led_masa).
 
 Yaver'in "led_control" skill'inden gelen MQTT mesajlarini dinler, dahili
-LED'i yakar/sondurur. skills.py bu cihaza C:\\yaver\\config.yaml'daki
+LED'i yakar/sondurur. skills.py bu cihaza proje kokundeki config.yaml'in
 devices.pico_led_masa.topic konusunda "on" ya da "off" yayinlar. Baska bir
 Pico W/LED eklerken: config.yaml'a yeni bir devices girdisi ekle (farkli
 topic ile), bu dosyayi kopyalayip TOPIC sabitini o yeni topic'e cevir.

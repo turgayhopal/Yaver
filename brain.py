@@ -22,10 +22,10 @@ import threading
 import time
 import uuid
 from collections import deque
-from pathlib import Path
 
 import httpx
-import yaml
+
+from common import ROOT, guard, load_config, mqtt_client, mqtt_connect, parse_payload, text_field
 
 # LLM bazen (nadiren) sistem promptunun yasagina ragmen emoji uretiyor (bkz.
 # "Bilinen model tuhafligi"). Windows konsolu varsayilan kod sayfasi (orn.
@@ -35,9 +35,17 @@ import yaml
 # ile boyle karakterler konsolda "?" olarak gorunur ama surec asla cokmez.
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-ROOT = Path(__file__).parent
-CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+CONFIG = load_config()
 BRAIN = CONFIG["brain"]
+LLM = CONFIG["llm"]
+
+# Hangi LLM'in kullanilacagi tamamen config.yaml -> llm.provider'da. Simdilik
+# sadece "local" (OpenAI uyumlu yerel sunucu: Ollama, llama.cpp...) var;
+# ileride bir internet servisi (orn. claude) ayni ayarla secilecek.
+if LLM["provider"] != "local":
+    raise SystemExit(f"llm.provider '{LLM['provider']}' henuz desteklenmiyor (simdilik sadece 'local').")
+LOCAL = LLM["local"]
+CHAT_URL = f"{LOCAL['server']}/v1/chat/completions"
 
 MEMORY_FILE = ROOT / "memory.json"    # kalici bilgiler (ad, tercihler)
 HISTORY_FILE = ROOT / "history.json"  # son konusma turlari
@@ -85,12 +93,19 @@ def write_history():
     )
 
 
-def system_prompt():
+def system_prompt(tools_enabled=True):
     """Tarih/saat KASITLI OLARAK yok - kucuk model bu bilgiyi context'te gorunce
     sorulmadan sohbete sikistirip sacmalamaya basliyor. Zaman gercekten gerekince
     skills.py ile gercek bir arac (tool call) olarak eklenecek, korlemesine
-    context'e gomulmeyecek."""
+    context'e gomulmeyecek.
+
+    tools_enabled=False (skills kapali): model hicbir arac gormedigi halde
+    "LED'i sondurdum" diye uyduruyordu (yasanmis) - acikca yapamayacagi
+    soylenir. Bu not sadece araclarin durumu degisince degisir, yani onek
+    onbellegi her turda degil sadece o anda bir kez yenilenir."""
     text = BRAIN["system_prompt"].strip()
+    if not tools_enabled:
+        text += "\n" + BRAIN["no_tools_note"].strip()
     known = read_memory()
     if known:
         lines = "\n".join(f"- {k}: {v}" for k, v in known.items())
@@ -130,21 +145,40 @@ def call_skill(name, params):
 # fonksiyonlari her cagrida kendi gecici Client'ini acip kapatiyordu - localhost
 # uzerinde bile bu olculebilir bir gecikme ekliyordu (bkz. config.yaml'daki
 # 127.0.0.1 notu, ayni turden bir maliyet).
-http_client = httpx.Client(timeout=120)
+http_client = httpx.Client(timeout=LOCAL["timeout_sec"])
+
+
+def request_body(messages, **fields):
+    """Her LLM isteginin ortak govdesi. model: Ollama hangi modeli
+    kullanacagini bundan bilir (llama.cpp tek modelli, yok sayar).
+    request_options: config.yaml'dan sunucuya ozel ek alanlar."""
+    body = {
+        "model": LOCAL["model"],
+        "messages": messages,
+        "temperature": BRAIN["temperature"],
+        "max_tokens": BRAIN["max_tokens"],
+        **fields,
+    }
+    body.update(LOCAL.get("request_options") or {})
+    return body
+
 
 SENTENCE_END = re.compile(r"(?<=[.!?:;])\s+|\n+")
 
 
 def split_sentence(buffer):
-    """Tamponda tamamlanmis cumle varsa (cumle, kalan) dondurur."""
-    match = SENTENCE_END.search(buffer)
-    if not match:
-        return None, buffer
-    cut = match.end()
-    sentence = buffer[:cut].strip()
-    if len(sentence) < 12:  # cok kisa parca, biraz daha bekle
-        return None, buffer
-    return sentence, buffer[cut:]
+    """Tamponda tamamlanmis cumle varsa (cumle, kalan) dondurur.
+
+    Cok kisa bir parca ("Tamam.") tek basina yayinlanmaz, bir SONRAKI cumle
+    sonuyla birlestirilir ("Tamam. Lamba acik."). Onceden sadece ILK cumle
+    sonuna bakiliyordu: o kisaysa sonrakilere hic bakilmiyor, cevabin
+    tamami LLM bitene kadar bekliyordu - akisin tum faydasi kayboluyordu.
+    """
+    for match in SENTENCE_END.finditer(buffer):
+        sentence = buffer[:match.end()].strip()
+        if len(sentence) >= BRAIN["min_sentence_chars"]:
+            return sentence, buffer[match.end():]
+    return None, buffer
 
 
 def iter_deltas(body):
@@ -156,9 +190,7 @@ def iter_deltas(body):
     (buffer'i full_text'e tekrar ekleme hatasi gibi) hata yasandi. Artik TEK
     yerde; cagiran taraf sadece delta.get("content")/["tool_calls"] okur.
     """
-    with http_client.stream(
-        "POST", f"{BRAIN['server']}/v1/chat/completions", json=body
-    ) as r:
+    with http_client.stream("POST", CHAT_URL, json=body) as r:
         r.raise_for_status()
         for line in r.iter_lines():
             if not line.startswith("data: "):
@@ -174,18 +206,13 @@ def iter_deltas(body):
 
 def stream_reply(messages, on_sentence):
     """LLM'den cumle cumle cevap alir, her tamamlanan cumlede on_sentence cagirir."""
-    body = {
-        "messages": messages,
-        "temperature": BRAIN["temperature"],
-        "max_tokens": BRAIN["max_tokens"],
-        "stream": bool(BRAIN["stream"] and on_sentence),
-    }
+    body = request_body(messages, stream=bool(BRAIN["stream"] and on_sentence))
 
     t0 = time.time()
     full_text = ""
 
     if not body["stream"]:
-        r = http_client.post(f"{BRAIN['server']}/v1/chat/completions", json=body)
+        r = http_client.post(CHAT_URL, json=body)
         r.raise_for_status()
         full_text = r.json()["choices"][0]["message"]["content"].strip()
         if on_sentence:
@@ -227,18 +254,12 @@ def stream_decision(messages, on_sentence):
 
     Donus: (full_text, tool_call). full_text zaten on_sentence ile soylenmis
     olur - tool_call None olsa da OLMASA da, cunku model bir araci cagirmadan
-    ONCE kisa bir on-soz soyleyip sonra aracı cagirabilir (bu sirali degil,
+    ONCE kisa bir on-soz soyleyip sonra araci cagirabilir (bu sirali degil,
     ayni turde ikisi de olabilir) - full_text'i sessizce atmak, zaten
     seslendirilmis bir cumleyi gecmisten dusurup tutarsiz birakiyordu
     (yasanmis bir hata). tool_call None ise arac cagrilmamis demektir.
     """
-    body = {
-        "messages": messages,
-        "temperature": BRAIN["temperature"],
-        "max_tokens": BRAIN["max_tokens"],
-        "tools": list(available_tools),
-        "stream": True,
-    }
+    body = request_body(messages, tools=list(available_tools), stream=True)
     t0 = time.time()
     buffer = ""
     full_text = ""
@@ -293,6 +314,51 @@ def stream_decision(messages, on_sentence):
     return full_text.strip() or None, tool_call
 
 
+def uses_tools(turn):
+    return any(m.get("role") == "tool" or m.get("tool_calls") for m in turn)
+
+
+def visible_history(tools_enabled):
+    """LLM'e gonderilecek gecmis turlari. Araclar kapaliyken (skills
+    calismiyor) arac kullanilan turlar TAMAMEN cikarilir:
+    - arac mesajlari kalirsa, araci tanimayan model cagriyi DUZ METIN olarak
+      yaziyordu ('{"name": "led_control", ...}</tool_call>'), hoparlorden
+      okunuyordu (yasanmis);
+    - sadece arac mesajlari cikarilirsa geriye "ledi yak" -> "LED acildi"
+      kaliyor, model bunu taklit edip araci olmadigi halde "sondurdum" diye
+      uyduruyordu (yasanmis).
+    Gecmisin kendisi degismez, sadece LLM'e giden kopya."""
+    if tools_enabled:
+        return list(history)
+    return [turn for turn in history if not uses_tools(turn)]
+
+
+def build_messages(user_text):
+    """Sistem promptu + gecmis + yeni soru. Donus: (messages, tools_enabled).
+    Araclar kapaliyken gecmisteki arac mesajlari LLM'e gonderilmez."""
+    tools_enabled = bool(available_tools) and client_ref[0] is not None
+    messages = [{"role": "system", "content": system_prompt(tools_enabled)}]
+    for turn in visible_history(tools_enabled):
+        messages.extend(turn)
+    messages.append({"role": "user", "content": user_text})
+    return messages, tools_enabled
+
+
+def warm_up():
+    """Modeli onceden yukler ve sistem promptu + gecmisi sunucunun onek
+    onbellegine alir - ilk gercek soru soguk yuklemeyi (~12 sn, olculdu)
+    beklemesin. Tek token uretir; cevap kullanilmaz, gecmise yazilmaz.
+    Basarisiz olursa sadece yazdirir: LLM kapali olsa da brain calismali."""
+    messages, _ = build_messages(".")
+    t0 = time.time()
+    try:
+        r = http_client.post(CHAT_URL, json=request_body(messages, max_tokens=1, stream=False))
+        r.raise_for_status()
+        print(f"  LLM isindi ({time.time() - t0:.1f} sn)")
+    except httpx.HTTPError as error:
+        print(f"  LLM isitilamadi: {error}")
+
+
 def ask(question, on_sentence=None):
     """LLM'e sorar. on_sentence verilirse her tamamlanan cumlede cagirir.
 
@@ -303,15 +369,12 @@ def ask(question, on_sentence=None):
     yoksa (skills.py kapaliysa) bu adim tamamen atlanir, davranis oncekiyle
     birebir aynidir.
     """
-    messages = [{"role": "system", "content": system_prompt()}]
-    for turn in history:
-        messages.extend(turn)
-    messages.append({"role": "user", "content": question})
+    messages, tools_enabled = build_messages(question)
 
     full_text = None
     tool_messages = []  # bu turda kullanildiysa: [decision, tool_sonucu] - gecmise de yazilir
 
-    if available_tools and client_ref[0] is not None:
+    if tools_enabled:
         content, tool_call = stream_decision(messages, on_sentence)
 
         if tool_call:
@@ -354,12 +417,7 @@ def ask(question, on_sentence=None):
 
 # --------------------------------------------------------------------------- MQTT
 def main():
-    import paho.mqtt.client as mqtt
-
-    try:
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="yaver-brain")
-    except AttributeError:
-        client = mqtt.Client(client_id="yaver-brain")
+    client = mqtt_client("yaver-brain")
     client_ref[0] = client
 
     question_queue = queue.Queue()
@@ -373,13 +431,18 @@ def main():
 
     def publish_status(status):
         # face.py (masaustu widget) bunu dinler - LLM/ses hattina hicbir
-        # etkisi yok, ateşle-unut (fire-and-forget) bir MQTT yayini.
+        # etkisi yok, atesle-unut (fire-and-forget) bir MQTT yayini.
         client.publish(
             CONFIG["mqtt"]["topic_status"],
             json.dumps({"module": "brain", "status": status}, ensure_ascii=False),
         )
 
     def worker():
+        # Isitma burada, kuyruktan once: MQTT ag thread'ini bloklamaz, ama
+        # gelen ilk soru isinma bitene kadar kuyrukta bekler (zaten LLM'i
+        # bekleyecekti).
+        if LOCAL.get("warm_up"):
+            warm_up()
         while True:
             question = question_queue.get()
             print(f'\nSORU: "{question}"')
@@ -398,32 +461,40 @@ def main():
             finally:
                 publish_status("done")
 
+    @guard
     def on_message(client_, userdata, msg):
-        if msg.topic == CONFIG["skills"]["topic_result"]:
-            try:
-                packet = json.loads(msg.payload.decode("utf-8"))
-            except json.JSONDecodeError:
-                return
-            entry = pending_skill_results.get(packet.get("id"))
-            if entry:
-                entry["result"] = packet
-                entry["event"].set()
-            return
-
         if msg.topic == CONFIG["skills"]["topic_list"]:
+            # Arac listesi bir JSON DIZISI (diger mesajlar gibi nesne degil).
+            # Bos yuk = skills.py kapandi (retained mesaj temizlendi): araclar
+            # LLM'e artik tanitilmasin, yoksa model olmayan bir araci cagirip
+            # zaman asimina dusuyordu.
+            if not msg.payload:
+                available_tools.clear()
+                print("  araclar kaldirildi (skills kapali)")
+                return
             try:
                 tools = json.loads(msg.payload.decode("utf-8"))
-            except json.JSONDecodeError:
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return
+            if not isinstance(tools, list):
                 return
             available_tools[:] = tools
             names = [t["function"]["name"] for t in available_tools]
             print(f"  {len(available_tools)} arac ogrenildi: {', '.join(names)}")
             return
 
-        try:
-            question = json.loads(msg.payload.decode("utf-8")).get("text", "").strip()
-        except json.JSONDecodeError:
+        packet = parse_payload(msg)
+        if packet is None:
             return
+
+        if msg.topic == CONFIG["skills"]["topic_result"]:
+            entry = pending_skill_results.get(packet.get("id"))
+            if entry:
+                entry["result"] = packet
+                entry["event"].set()
+            return
+
+        question = text_field(packet)
         if question:
             question_queue.put(question)
 
@@ -435,11 +506,11 @@ def main():
 
     client.on_connect = on_connect
     client.on_message = on_message
-    client.connect(CONFIG["mqtt"]["server"], CONFIG["mqtt"]["port"], 60)
+    mqtt_connect(client, CONFIG)
 
     read_history()
     threading.Thread(target=worker, daemon=True).start()
-    print(f"Beyin hazir. LLM: {BRAIN['server']}  (gecmis: {len(history)} tur)")
+    print(f"Beyin hazir. LLM: {LOCAL['model']} @ {LOCAL['server']}  (gecmis: {len(history)} tur)")
     client.loop_forever()
 
 

@@ -6,47 +6,29 @@ ve MQTT uzerinden yayinlar. Baska hicbir modulun varligini bilmez.
 Kullanim:
     python ear.py              -> config.yaml'daki ayarlarla
     python ear.py --textonly   -> MQTT'ye yollamaz, sadece ekrana yazar
+    python ear.py --cuda       -> CUDA kutuphane teshisi, sonra cikar
 """
 
-import os
-import sys
-from pathlib import Path
-
-# CTranslate2 (Whisper motoru) CUDA DLL'lerini sistemde arar ama pip ile kurulan
-# nvidia paketleri PATH'e girmez. Burada, faster_whisper import edilmeden ONCE
-# tanitiyoruz. NVIDIA klasor duzenini surumden surume degistirdigi icin sabit
-# yol yazmiyoruz: nvidia altinda DLL iceren HER klasoru buluyoruz.
-if sys.platform == "win32":
-    _root = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
-    _dirs = sorted({p.parent for p in _root.rglob("*.dll")}) if _root.exists() else []
-    for _d in _dirs:
-        try:
-            os.add_dll_directory(str(_d))
-        except OSError:
-            pass
-    # Bazi yukleyiciler add_dll_directory yerine PATH'e bakar, ikisini de doldur.
-    if _dirs:
-        os.environ["PATH"] = os.pathsep.join(str(d) for d in _dirs) + os.pathsep + os.environ["PATH"]
-    if "--dll" in sys.argv:
-        print(f"nvidia koku: {_root}  (var mi: {_root.exists()})")
-        for _d in _dirs:
-            print("  +", _d)
-            for _f in sorted(_d.glob("*.dll"))[:6]:
-                print("      ", _f.name)
-        sys.exit(0)
-
+import ctypes
+import importlib.util
 import json
+import os
 import queue
 import re
+import sys
 import threading
 import time
+import unicodedata
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
-import yaml
 
-CONFIG = yaml.safe_load((Path(__file__).parent / "config.yaml").read_text(encoding="utf-8"))
+from common import guard, load_config, mqtt_client, mqtt_connect, parse_payload
+
+CONFIG = load_config()
+REC = CONFIG["recording"]
 SILENT_MODE = "--textonly" in sys.argv
 
 audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
@@ -59,19 +41,12 @@ ack_done = threading.Event()     # "efendim" bitti, kayda baslayabiliriz
 def mqtt_connect():
     if SILENT_MODE:
         return None
-    import paho.mqtt.client as mqtt
+    client = mqtt_client("yaver-ear")
 
-    try:
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="yaver-ear")
-    except AttributeError:  # paho 1.x
-        client = mqtt.Client(client_id="yaver-ear")
-
+    @guard
     def on_status(client_, userdata, msg):
-        try:
-            packet = json.loads(msg.payload.decode("utf-8"))
-        except json.JSONDecodeError:
-            return
-        if packet.get("module") != "mouth":
+        packet = parse_payload(msg)
+        if packet is None or packet.get("module") != "mouth":
             return
         status = packet.get("status")
         if status == "speaking":
@@ -86,7 +61,7 @@ def mqtt_connect():
 
     client.on_connect = on_connect
     client.on_message = on_status
-    client.connect(CONFIG["mqtt"]["server"], CONFIG["mqtt"]["port"], 60)
+    mqtt_connect(client, CONFIG)
     client.loop_start()
     print(f"MQTT baglandi: {CONFIG['mqtt']['server']}:{CONFIG['mqtt']['port']}")
     return client
@@ -102,7 +77,7 @@ def publish_status(client, status):
 
 
 def publish_text(client, text):
-    packet = {"text": text, "source": "ear-pc", "timestamp": time.time()}
+    packet = {"text": text, "source": CONFIG["audio"]["source_name"], "timestamp": time.time()}
     if client is None:
         print(f"  [yayinlanmadi] {packet}")
         return
@@ -120,8 +95,9 @@ def rms(block):
     return float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
 
 
-def measure_ambient(seconds=1.5):
+def measure_ambient():
     """Acilista ortam gurultusunu olcup sessizlik esigini belirler."""
+    seconds = REC["ambient_sec"]
     print(f"Ortam gurultusu olculuyor ({seconds} sn, sessiz ol)...")
     blocks = []
     end_time = time.time() + seconds
@@ -130,17 +106,83 @@ def measure_ambient(seconds=1.5):
             blocks.append(rms(audio_queue.get(timeout=1)))
         except queue.Empty:
             break
-    baseline = float(np.median(blocks)) if blocks else 100.0
-    threshold = max(baseline * CONFIG["recording"]["silence_multiplier"], 180.0)
+    if not blocks:
+        print(f"  ses gelmedi, alt sinir kullaniliyor: {REC['min_threshold']:.0f}")
+        return float(REC["min_threshold"])
+    baseline = float(np.median(blocks))
+    threshold = max(baseline * REC["silence_multiplier"], REC["min_threshold"])
     print(f"  ortam: {baseline:.0f}  ->  konusma esigi: {threshold:.0f}")
     return threshold
 
 
+# --------------------------------------------------------------------------- CUDA
+def nvidia_lib_dirs():
+    """pip ile kurulan nvidia-* paketlerinin (orn. nvidia-cublas-cu12)
+    kutuphane klasorleri. Kurulum yolu isletim sistemine ve venv duzenine
+    gore degistigi icin sabit yol yazmiyoruz: 'nvidia' paketini Python'a
+    sorup altinda .dll/.so iceren HER klasoru buluyoruz."""
+    spec = importlib.util.find_spec("nvidia")
+    if spec is None or not spec.submodule_search_locations:
+        return []
+    dirs = set()
+    for root in spec.submodule_search_locations:
+        for pattern in ("*.dll", "*.so*"):
+            dirs.update(p.parent for p in Path(root).rglob(pattern))
+    return sorted(dirs)
+
+
+def prepare_cuda_libraries(verbose=False):
+    """CTranslate2'nin (Whisper motoru) aradigi CUDA kutuphanelerini
+    (libcublas.so.12 / cublas64_12.dll) pip'le kurulan nvidia paketlerinden
+    tanitir - faster_whisper import edilmeden ONCE cagrilmali.
+
+    Sistemdeki CUDA surumu farkli olabilir (orn. sadece libcublas.so.13 var)
+    ve pip paketleri arama yoluna girmez. Windows'ta klasorler DLL arama
+    yoluna eklenir. Linux'ta LD_LIBRARY_PATH surec basladiktan sonra
+    degistirilemiyor, bu yuzden kutuphaneleri onceden RTLD_GLOBAL ile
+    yukluyoruz - CTranslate2 sonra ayni adi istediginde zaten yuklu olani
+    kullanir."""
+    dirs = nvidia_lib_dirs()
+    if sys.platform == "win32":
+        for d in dirs:
+            try:
+                os.add_dll_directory(str(d))
+            except OSError:
+                pass
+        # Bazi yukleyiciler add_dll_directory yerine PATH'e bakar, ikisini de doldur.
+        if dirs:
+            os.environ["PATH"] = os.pathsep.join(str(d) for d in dirs) + os.pathsep + os.environ["PATH"]
+        loaded = [str(d) for d in dirs]
+    else:
+        # Kutuphaneler birbirine bagli (libcublas -> libcublasLt). Sirayi
+        # bilmeden: yuklenemeyenleri tekrar dene, ilerleme olmayinca dur.
+        pending = sorted(p for d in dirs for p in d.glob("lib*.so.*"))
+        loaded = []
+        while pending:
+            failed = []
+            for lib in pending:
+                try:
+                    ctypes.CDLL(str(lib), mode=ctypes.RTLD_GLOBAL)
+                    loaded.append(lib.name)
+                except OSError:
+                    failed.append(lib)
+            if len(failed) == len(pending):
+                break
+            pending = failed
+    if verbose:
+        print(f"nvidia kutuphane klasorleri: {len(dirs)}")
+        for d in dirs:
+            print("  +", d)
+        print("yuklenen:", ", ".join(loaded) or "-")
+
+
 # --------------------------------------------------------------------------- moduller
 def load_whisper():
+    w = CONFIG["whisper"]
+    if w["device"] != "cpu":
+        prepare_cuda_libraries()
     from faster_whisper import WhisperModel
 
-    w = CONFIG["whisper"]
 
     def try_load(device, compute_type):
         model = WhisperModel(w["model"], device=device, compute_type=compute_type)
@@ -159,7 +201,7 @@ def load_whisper():
             raise
         print(f"  GPU acilmadi: {error}")
         print("  CPU'ya dusuluyor. Hizlandirmak icin:")
-        print("    pip install nvidia-cublas-cu12 nvidia-cudnn-cu12")
+        print("    pip install nvidia-cublas-cu12   (teshis: python ear.py --cuda)")
         model = try_load("cpu", "int8")
         print("  hazir (cpu/int8)")
         return model
@@ -191,12 +233,18 @@ def record_speech(threshold, pre_roll=None):
     silence_blocks = 0
     resets = 0  # sessizlik sayaci kac kez bir gurultu patlamasiyla sifirlandi (teshis icin)
     block_sec = CONFIG["audio"]["block_size"] / CONFIG["audio"]["sample_rate"]
-    required_silence = int(CONFIG["recording"]["silence_sec"] / block_sec)
-    max_blocks = int(CONFIG["recording"]["max_sec"] / block_sec)
+    required_silence = int(REC["silence_sec"] / block_sec)
+    max_blocks = int(REC["max_sec"] / block_sec)
     speech_started = False
 
     for _ in range(max_blocks):
         block = audio_queue.get()
+        # Kayit sirasinda agiz konusmaya basladiysa (orn. onceki sorunun
+        # cevabi geldi) kaydi at: yoksa Yaver'in kendi sesi kayda girer,
+        # cevabinda "Yaver" geciyorsa kendi kendini tetikleyebilirdi.
+        if mouth_busy.is_set():
+            print(" iptal (agiz konusmaya basladi).")
+            return np.array([], dtype=np.int16)
         chunks.append(block)
         if rms(block) > threshold:
             if speech_started and silence_blocks > 0:
@@ -212,16 +260,25 @@ def record_speech(threshold, pre_roll=None):
     return np.concatenate(chunks) if chunks else np.array([], dtype=np.int16)
 
 
-# Whisper sessizlik/gurultu uzerine bunlari uydurur. Coplugu at.
-JUNK = {
-    "them", "you", "thank you", "thanks for watching", "bye",
-    "altyazi m.k.", "abone ol", "abone olmayi unutmayin",
-    "izlediginiz icin tesekkurler", "tesekkurler", "altyazi",
-}
+def normalize(text):
+    """Karsilastirma icin sadelestirir: kucuk harf, aksansiz (s/c/g/o/u),
+    noktasiz i, noktalama yok, tek bosluk. Ornek: 'Altyazi M.K.' -> 'altyazi mk'.
+    Onceki elle harf degistirme u/c sapkalarini kaciriyordu ("Tesekkurler"
+    filtrelenmiyordu)."""
+    text = unicodedata.normalize("NFKD", text.lower())
+    # combining: aksan isaretleri (ve lower()'in 'I' (buyuk noktali) icin
+    # biraktigi nokta) ayri karakter olarak duser. Noktasiz i ayristirilamaz, elle.
+    text = "".join(ch for ch in text if not unicodedata.combining(ch)).replace(chr(0x131), "i")
+    text = re.sub(r"[^\w\s]", "", text)
+    return " ".join(text.split())
+
+
+# Whisper sessizlik/gurultu uzerine bunlari uydurur - liste config.yaml'da.
+JUNK = {normalize(phrase) for phrase in CONFIG["whisper"]["junk_phrases"]}
 
 
 def is_junk(text):
-    normalized = text.lower().strip(" .,!?").replace("ı", "i").replace("ş", "s").replace("ğ", "g")
+    normalized = normalize(text)
     return normalized in JUNK or len(normalized) < 2
 
 
@@ -235,22 +292,23 @@ def contains_trigger(text):
 
 
 def transcribe(whisper, audio):
+    w = CONFIG["whisper"]
     duration = len(audio) / CONFIG["audio"]["sample_rate"]
-    if duration < CONFIG["recording"]["min_sec"]:
+    if duration < REC["min_sec"]:
         return ""
     t0 = time.time()
     segments, info = whisper.transcribe(
         audio.astype(np.float32) / 32768.0,
-        language=CONFIG["whisper"]["language"],
-        beam_size=1,
-        temperature=0.0,
-        vad_filter=True,
+        language=w["language"],
+        beam_size=w["beam_size"],
+        temperature=w["temperature"],
+        vad_filter=w["vad_filter"],
         condition_on_previous_text=False,
-        no_speech_threshold=0.6,
+        no_speech_threshold=w["no_speech_threshold"],
         # Nadir/yabanci kelimeler ("Yaver", "LED" gibi) Whisper tarafindan siklikla
         # benzer sesli yaygin kelimelere cevriliyordu (Ya var, Lady, L'de...).
         # hotwords bunlarin taninma olasiligini artirir - bkz. config.yaml.
-        hotwords=CONFIG["whisper"]["hotwords"],
+        hotwords=w["hotwords"],
     )
     text = " ".join(s.text.strip() for s in segments).strip()
     print(f"  ({duration:.1f} sn ses -> {time.time() - t0:.2f} sn cevrim)")
@@ -274,10 +332,10 @@ def main():
         callback=audio_callback,
     )
 
-    pre_buffer = deque(maxlen=int(0.6 * CONFIG["audio"]["sample_rate"] / CONFIG["audio"]["block_size"]))
+    pre_buffer = deque(maxlen=int(REC["pre_roll_sec"] * CONFIG["audio"]["sample_rate"] / CONFIG["audio"]["block_size"]))
 
     with stream:
-        time.sleep(0.5)  # akisin oturmasini bekle, yoksa olcum sifir cikar
+        time.sleep(CONFIG["audio"]["settle_sec"])  # akisin oturmasini bekle, yoksa olcum sifir cikar
         while not audio_queue.empty():
             audio_queue.get()
         threshold = measure_ambient()
@@ -312,7 +370,7 @@ def main():
                 publish_status(client, "woke")
                 if client is not None:
                     ack_done.wait(CONFIG["wakeword"]["ack_wait_sec"])
-                    time.sleep(0.15)  # hoparlorun sonlanmasi icin kucuk pay
+                    time.sleep(CONFIG["wakeword"]["ack_tail_sec"])  # hoparlorun sonlanmasi icin kucuk pay
                 while not audio_queue.empty():
                     audio_queue.get()
             else:
@@ -334,12 +392,15 @@ def main():
             else:
                 print(f'  (tetik kelime yok, atlandi: "{text}")')
 
-            time.sleep(CONFIG["wakeword"]["cooldown_sec"] if oww else 0.3)
+            time.sleep(CONFIG["wakeword"]["cooldown_sec"] if oww else REC["cooldown_sec"])
             while not audio_queue.empty():
                 audio_queue.get()
 
 
 if __name__ == "__main__":
+    if "--cuda" in sys.argv:
+        prepare_cuda_libraries(verbose=True)
+        sys.exit(0)
     try:
         main()
     except KeyboardInterrupt:

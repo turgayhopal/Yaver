@@ -11,13 +11,12 @@ Kullanim:
     python face.py
 """
 
-import json
+import os
 import sys
 import threading
 import time
-from pathlib import Path
 
-import yaml
+from common import ROOT, guard, load_config, mqtt_client, mqtt_connect, parse_payload
 
 # DPI olcekleme (orn. %125) acikken bu sureci "DPI-aware" olarak isaretlemezsek
 # SPI_GETWORKAREA (asagida) sanal/olceklenmis piksel dondurebiliyor, webview'in
@@ -34,8 +33,7 @@ if sys.platform == "win32":
         except Exception:
             pass
 
-ROOT = Path(__file__).parent
-CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+CONFIG = load_config()
 FACE = CONFIG["face"]
 WIDGET_HTML = ROOT / "face" / "widget.html"
 
@@ -112,12 +110,15 @@ PRIORITY = ["speaking", "thinking", "listening", "idle"]
 
 
 def main():
-    import paho.mqtt.client as mqtt
+    # Ortam degiskenleri (orn. Linux/Wayland'de QT_QPA_PLATFORM) Qt yuklenmeden
+    # ONCE ayarlanmali - bkz. config.yaml face.env.
+    for key, value in (FACE.get("env") or {}).items():
+        os.environ.setdefault(key, str(value))
     import webview
 
     # SPI_GETWORKAREA (gorev cubugu haric alan) denendi ama Qt'nin kendi
     # ekran/pencere koordinat birimiyle (DPI olcegine gore mantiksal piksel)
-    # uyusmadigi icin daha kötü sonuc verdi (yasanmis) - screen.width/height
+    # uyusmadigi icin daha kotu sonuc verdi (yasanmis) - screen.width/height
     # DAHA GUVENILIR cunku ikisi de ayni (Qt) kaynaktan geliyor. Gorev
     # cubugunu atlamak icin margin_bottom'a guvenip config.yaml'dan ayarla.
     screen = webview.screens[FACE["screen_index"]]
@@ -134,17 +135,17 @@ def main():
 
     # Kontrast icin arka plani ornekle - widget'in kendi dikdortgeninin
     # SOLUNDAKI seridi okur (kendi cemberinin ustunu degil, bkz. watch_backdrop).
-    sample_width = min(90, max(0, x - screen.x))
+    sample_width = min(FACE["backdrop_sample_width"], max(0, x - screen.x))
     if sample_width > 0:
         sample_rect = {"left": x - sample_width, "top": y, "width": sample_width, "height": height}
         threading.Thread(target=watch_backdrop, args=(window, sample_rect), daemon=True).start()
 
     module_state = {"ear": "idle", "brain": "idle", "mouth": "idle"}
 
+    @guard
     def on_message(client_, userdata, msg):
-        try:
-            packet = json.loads(msg.payload.decode("utf-8"))
-        except json.JSONDecodeError:
+        packet = parse_payload(msg)
+        if packet is None:
             return
         module = packet.get("module")
         sub_state = STATE_MAP.get((module, packet.get("status")))
@@ -162,22 +163,19 @@ def main():
         client_.subscribe(CONFIG["mqtt"]["topic_status"])
         print(f"Dinleniyor: {CONFIG['mqtt']['topic_status']}")
 
-    try:
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="yaver-face")
-    except AttributeError:
-        client = mqtt.Client(client_id="yaver-face")
+    client = mqtt_client("yaver-face")
     client.on_connect = on_connect
     client.on_message = on_message
-    client.connect(CONFIG["mqtt"]["server"], CONFIG["mqtt"]["port"], 60)
+    mqtt_connect(client, CONFIG)
     client.loop_start()  # arka planda kendi thread'i - webview.start() burayi bloklamaz
 
     print("Yuz hazir.")
     # gui="qt": pywebview'in Windows'taki varsayilan arka ucu (WinForms/
     # WebView2) gercek pencere saydamligini desteklemiyor - sadece HTML
-    # icindeki arka planı saydam yapiyor, pencerenin kendisi opak griye
+    # icindeki arka plani saydam yapiyor, pencerenin kendisi opak griye
     # boyaniyordu (yasanmis ve gorulmus bir sorun). Qt arka ucu (PySide6)
     # gercek alfa saydamligi destekliyor (Qt.WA_TranslucentBackground).
-    webview.start(gui="qt")
+    webview.start(gui=FACE["gui"])
 
 
 if __name__ == "__main__":

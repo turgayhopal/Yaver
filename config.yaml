@@ -2,8 +2,8 @@
 # Platforma ozel HER SEY burada. Pi'ye tasirken sadece bu dosyayi degistireceksin.
 
 mqtt:
-  server: 127.0.0.1         # "localhost" degil - Windows'ta IPv6 (::1) once denenip zaman
-                              # asimina ugruyor, sonra IPv4'e dusuyor (bkz. brain.server ayni not).
+  server: 127.0.0.1         # "localhost" degil - bazi sistemlerde IPv6 (::1) once denenip zaman
+                              # asimina ugruyor, sonra IPv4'e dusuyor (bkz. llm.local.server ayni not).
                               # Pi'ye tasiyinca buraya PC'nin IP'sini yazacaksin
   port: 1883
   topic_text: yaver/speech/text
@@ -25,6 +25,10 @@ face:
   backdrop_sample_sec: 2.0       # arka plan (masaustu) ne kadar surede bir orneklenip
                                    # acik/koyu kontrast paketi arasinda gecis yapilsin
   backdrop_light_threshold: 140  # 0-255 ortalama parlaklik - bunun ustu "light" sayilir
+  backdrop_sample_width: 90      # widget'in solunda orneklenen masaustu seridinin genisligi (piksel)
+  gui: qt                        # pywebview arka ucu. qt: gercek pencere saydamligi destekliyor
+                                  # (Windows'un varsayilani WinForms/WebView2 desteklemiyor)
+  env: {}                        # Qt yuklenmeden once ayarlanacak ortam degiskenleri
 
 skills:
   topic_request: yaver/skill/request   # brain -> skills: {"id","name","params"}
@@ -34,7 +38,7 @@ skills:
 
 devices:
   # Genel cihaz kayit defteri - burada tanimli her cihaz, ayni "type"a sahip
-  # skill'ler tarafindan otomatik gorulur (bkz. skills.py led_devices()).
+  # skill'ler tarafindan otomatik gorulur (bkz. skills.py devices_by_type()).
   # Yeni bir fiziksel LED/kart eklemek icin sadece buraya yeni bir girdi ekle,
   # skill kodu degismez. Anahtar (orn. pico_led_masa) MQTT topic'inde ve
   # LLM'in sececegi kimlik olarak kullanilir - benzersiz ve sabit tut.
@@ -47,50 +51,53 @@ launcher:
   # main.py'nin tek komuttan baslattigi surecler. Her biri hala AYRI bir
   # isletim sistemi sureci - main.py sadece elle ayri terminallerde girilen
   # komutlari tek yerden calistirir, modullerin birbirini tanimasi/dogrudan
-  # cagirmasi yok (iletisim yine sadece MQTT).
-  llama_server:
-    binary: C:/yaver/llama/llama-server.exe
-    model: C:/yaver/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
-    ctx_size: 8128
-    n_gpu_layers: 99
-    port: 8080
-    parallel: 1   # tek KV-cache slotu - bkz. Commands.txt/CLAUDE.md notu, onbellek hep sicak kalsin diye
-    # --cache-type-k/v q8_0: KV-cache'i 8-bit'e indirir. GTX 1660'ta uretim
-    # hizini sinirlayan sey Tensor Core degil (yok), bellek bant genisligi -
-    # KV-cache trafigini yariya indirmek token/sn'yi artirabilir (kucuk bir
-    # kalite riskiyle). --flash-attn on: varsayilan 'auto' bu eski (Turing)
-    # GPU icin kapali kalmis olabilir, acikca 'on' deneniyor. DENEYSEL - ise
-    # yaramazsa ikisini de kaldir (once --flash-attn, sonra cache-type).
-    #
-    # --cache-reuse 256: brain.py'nin history'si sabit boyutlu bir pencere
-    # (history_turns) - dolunca en eski tur dusup yenisi eklenir (FIFO).
-    # Pencere kaydiginda onceki istekle ORTAK ONEK sadece sistem promptunda
-    # kaliyor, geri kalan tum baglam (900-1400 token, ozellikle arac cagrisi
-    # turlari agir) SIFIRDAN islenip yaniti yavaslatiyordu (yasanmis ve
-    # olculmus bir gecikme - "artik 1 sn altinda degil" sikayeti). Bu bayrak
-    # KV-shifting ile kaymis onbellegi de yeniden kullanmayi dener.
-    extra_args: [
-      "--jinja", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
-      "--flash-attn", "on", "--cache-reuse", "256",
-    ]
+  # cagirmasi yok (iletisim yine sadece MQTT). LLM sunucusu ve MQTT broker'i
+  # BURADAN BASLATILMAZ, arka planda calisan servisler olarak beklenir.
   modules:          # main.py bunlari sirayla baslatir (ayni python yorumlayicisiyla, sys.executable)
     - skills.py
     - brain.py
     - mouth.py
     - ear.py
     - face.py
+  check_timeout_sec: 3.0   # acilista broker/LLM ulasilabilirlik kontrolu icin bekleme
+  stop_timeout_sec: 5.0    # Ctrl+C'de bir surecin kapanmasi icin bekleme, sonra zorla oldurulur
+
+llm:
+  # Yaver'in hangi LLM'i kullanacagi. Brain bu bolumden okur, kodda hicbir
+  # model/sunucu adi yok - degistirmek icin sadece burayi duzenle.
+  #   local: OpenAI uyumlu /v1/chat/completions sunan yerel bir sunucu
+  #          (Ollama, llama.cpp llama-server, LM Studio...) - internet gerekmez.
+  #   (ileride: claude / baska bir internet servisi - henuz yok)
+  provider: local
+  local:
+    server: http://127.0.0.1:11434  # Ollama varsayilani. llama.cpp icin orn. :8080.
+                                     # "localhost" degil bilerek - bazi sistemlerde IPv6 (::1)
+                                     # once denenip zaman asimina ugruyor, her istege ~2 sn
+                                     # sabit gecikme ekliyordu (Windows'ta olculdu)
+    model: qwen3:4b-instruct         # duz "qwen3:4b" DEGIL - o dusunen (thinking) surum, sesli
+                                     # asistan icin cok yavas ve Ingilizce muhakeme sizdiriyor
+                                     # (olculdu, bkz. CLAUDE.md "LLM sunucusu notlari")
+    request_options:                 # her istege eklenecek ek alanlar (sunucuya ozel)
+      keep_alive: 30m                # Ollama: model son istekten bu kadar sonra VRAM'den cikar.
+                                     # Kisa olursa ilk soru ~12 sn bekler (soguk yukleme, olculdu);
+                                     # -1 = hic cikma (GPU'yu Yaver kapaliyken de tutar).
+                                     # llama.cpp bu alani yok sayar.
+                                     # Not: Ollama /v1 uzerinden num_ctx'i YOK SAYIYOR (olculdu) -
+                                     # baglam boyutu sunucu tarafinda (OLLAMA_CONTEXT_LENGTH,
+                                     # varsayilan 4096 - sistem promptu + 4 tur gecmis icin yeterli)
+    timeout_sec: 120                 # bir LLM isteginin en fazla suresi
+    warm_up: true                    # brain acilista modeli yukleyip sistem promptunu onbellege alsin
+                                     # (yoksa ilk gercek soru soguk yuklemeyi bekler)
 
 brain:
-  server: http://127.0.0.1:8080   # "localhost" degil bilerek - Windows'ta IPv6 (::1) once
-                                    # denenip zaman asimina ugruyor, sonra IPv4'e dusuyor -
-                                    # bu her istekte ~2 sn sabit gecikme ekliyor (olculdu)
-  history_turns: 4         # kac konusma turu hatirlansin. Kucuk model uzun gecmiste
+  history_turns: 4        # kac konusma turu hatirlansin. Kucuk model uzun gecmiste
                             # kendi kaliplarini (dolgu cumleleri) tekrarlamaya basliyor,
                             # bu yuzden dusuk tutuluyor - sadece kisa vadeli takip
                             # sorularini ("bir tane daha oner") hatirlamasi yeterli.
   temperature: 0.4
   max_tokens: 160           # sesli cevap kisa olmali
   stream: true              # cumle biter bitmez seslendir (gecikmeyi yariya indirir)
+  min_sentence_chars: 12    # bundan kisa cumle ("Tamam.") tek basina seslendirilmez, sonrakiyle birlesir
   system_prompt: |
     Sen Yaver adında, Türkçe konuşan bir sesli asistansın.
     Cevapların SESLİ okunacak, bu yüzden:
@@ -124,9 +131,14 @@ brain:
       (ASCII) yazım hem yanlış görünür hem sesli okunurken yanlış telaffuz
       edilir.
 
+  no_tools_note: |          # skills kapaliyken (hic arac yokken) sistem promptuna eklenir
+    - ŞU AN HİÇBİR CİHAZI KONTROL EDEMİYORSUN, araçların kapalı. Bir cihaz
+      (LED, ışık vb.) değiştirmen istenirse bunu şu an yapamadığını kısaca
+      söyle. ASLA "yaktım", "söndürdüm" gibi yapmış gibi konuşma.
+
 mouth:
-  voice_model: C:/yaver/voices/tr_TR-dfki-medium.onnx
-  output_device: null      # null = Windows varsayilani
+  voice_model: voices/tr_TR-dfki-medium.onnx   # goreli yol = proje kokune gore
+  output_device: null      # null = sistemin varsayilan cikisi. Ad parcasi da yazilabilir (orn. "pulse")
   volume: 1.0
   synthesis:                # Piper'in SynthesisConfig'i - dinleyerek secildi
                              # (4 varyant karsilastirildi, bu en net/dogal geldi)
@@ -142,9 +154,12 @@ mouth:
                              # bu kadar sure yeni cumle gelmezse "done" (bitti) yayinla
 
 audio:
-  input_device: 1           # null = Windows varsayilani. find_microphone.py ile numara ogren
+  input_device: null        # null = sistemin varsayilan girisi. find_microphone.py ile numara/ad ogren;
+                            # numara makineden makineye degisir, ad parcasi (orn. "USB") daha kalicidir
   sample_rate: 16000        # openWakeWord ve Whisper 16 kHz ister, degistirme
   block_size: 1280          # 80 ms. openWakeWord bu boyutu bekler, degistirme
+  settle_sec: 0.5           # mikrofon akisi acildiktan sonra oturmasi icin bekleme (yoksa ortam olcumu sifir cikar)
+  source_name: ear-pc       # yaver/speech/text'teki "source" alani - bu kulagin kimligi (Pi'de orn. ear-pi)
 
 wakeword:
   enabled: false            # false: surekli dinle, cumlede trigger_word gecince cevap ver.
@@ -154,12 +169,17 @@ wakeword:
   threshold: 0.5            # dusurursen daha kolay uyanir ama yanlis alarm artar
   cooldown_sec: 2.0         # uyandiktan sonra tekrar dinlemeye gecis beklemesi
   ack_wait_sec: 3.0         # "efendim" bitene kadar en fazla bu kadar bekle
+  ack_tail_sec: 0.15        # "efendim" bittikten sonra hoparlorun tamamen susmasi icin pay
 
 recording:
   silence_multiplier: 2.5   # ortam gurultusunun kac kati "konusma" sayilsin
+  min_threshold: 180        # konusma esigi bunun altina inmesin (cok sessiz odada her tikirti tetiklemesin)
+  ambient_sec: 1.5          # acilista ortam gurultusu bu kadar sure olculur
+  pre_roll_sec: 0.6         # tetiklenmeden onceki bu kadar ses kayda eklenir (cumlenin ilk hecesi)
   silence_sec: 0.8          # bu kadar sessizlik olunca kayit biter
   max_sec: 15
   min_sec: 0.7               # bundan kisa kayitlari coplugu at
+  cooldown_sec: 0.3         # bir kayit islendikten sonra tekrar dinlemeden once bekleme (tetik kelime modu)
 
 whisper:
   model: small                 # GPU + int8_float16 ile hizli, base'den cok daha isabetli. Pi'de: tiny/base
@@ -168,3 +188,19 @@ whisper:
   language: tr
   hotwords: "Yaver LED"        # nadir/yabanci kelimeler icin Whisper'a ipucu (yanlis duymayi azaltir).
                                 # yeni bir skill nadir bir kelime/isim kullanirsa buraya da ekle
+  beam_size: 1                 # 1 = en hizli (greedy). Artirmak isabeti biraz artirir, yavaslatir
+  temperature: 0.0
+  vad_filter: true             # Whisper'in kendi ses etkinlik filtresi - sessiz kisimlari atlar
+  no_speech_threshold: 0.6     # bu olasiligin ustunde "konusma yok" sayilir
+  junk_phrases:                # Whisper sessizlik/gurultu uzerine bunlari uydurur, coplugu at.
+    - them                     # Karsilastirma buyuk/kucuk harf, aksan ve noktalamadan bagimsiz.
+    - you
+    - thank you
+    - thanks for watching
+    - bye
+    - Altyazı M.K.
+    - Altyazı
+    - Abone ol
+    - Abone olmayı unutmayın
+    - İzlediğiniz için teşekkürler
+    - Teşekkürler

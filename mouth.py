@@ -16,14 +16,13 @@ import re
 import sys
 import threading
 import wave
-from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
-import yaml
 
-ROOT = Path(__file__).parent
-CONFIG = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+from common import guard, load_config, mqtt_client, mqtt_connect, parse_payload, resolve_path, text_field
+
+CONFIG = load_config()
 MOUTH = CONFIG["mouth"]
 
 speech_queue: "queue.Queue[dict]" = queue.Queue()
@@ -34,7 +33,7 @@ client_ref = [None]  # calisan is parcacigi buradan yayin yapar
 def load_voice():
     from piper import PiperVoice
 
-    path = Path(MOUTH["voice_model"])
+    path = resolve_path(MOUTH["voice_model"])
     if not path.exists():
         raise SystemExit(
             f"Ses modeli bulunamadi: {path}\n"
@@ -83,7 +82,7 @@ def synthesize(voice, text):
         if chunks:
             return np.concatenate(chunks), rate
     except (TypeError, ImportError):
-        pass  # eski API iki argüman ister ya da piper.config yok, asagi dusuyoruz
+        pass  # eski API iki arguman ister ya da piper.config yok, asagi dusuyoruz
 
     # Eski API (1.x): wave dosyasina yazar
     buffer = io.BytesIO()
@@ -159,28 +158,30 @@ def worker(voice):
 
 
 def main():
-    import paho.mqtt.client as mqtt
-
     voice = load_voice()
     prepare_acks(voice)
     threading.Thread(target=worker, args=(voice,), daemon=True).start()
 
-    try:
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="yaver-mouth")
-    except AttributeError:
-        client = mqtt.Client(client_id="yaver-mouth")
+    client = mqtt_client("yaver-mouth")
     client_ref[0] = client
+    # Son vasiyet (LWT): agiz konusurken cokerse "done" hic yayinlanmaz ve
+    # ear "agiz konusuyor" sanip sonsuza kadar sagir kalirdi. Baglanti
+    # koparsa broker "done"u agiz adina kendisi yayinlar.
+    client.will_set(
+        CONFIG["mqtt"]["topic_status"],
+        json.dumps({"module": "mouth", "status": "done"}),
+    )
 
+    @guard
     def on_message(client_, userdata, msg):
-        try:
-            packet = json.loads(msg.payload.decode("utf-8"))
-        except json.JSONDecodeError:
+        packet = parse_payload(msg)
+        if packet is None:
             return
         if msg.topic == CONFIG["mqtt"]["topic_status"]:
             if packet.get("module") == "ear" and packet.get("status") == "woke":
                 speech_queue.put({"type": "ack"})
             return
-        text = packet.get("text", "").strip()
+        text = text_field(packet)
         if text:
             speech_queue.put({"type": "text", "content": text})
 
@@ -191,7 +192,7 @@ def main():
 
     client.on_connect = on_connect
     client.on_message = on_message
-    client.connect(CONFIG["mqtt"]["server"], CONFIG["mqtt"]["port"], 60)
+    mqtt_connect(client, CONFIG)
     print("Agiz hazir.")
     client.loop_forever()
 

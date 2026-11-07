@@ -1,0 +1,4 @@
+# Sadece NVIDIA GPU'lu makinelerde: Whisper motorunun (CTranslate2) istedigi
+# CUDA 12 kutuphanesi. Sistemde farkli bir CUDA surumu olsa bile calisir,
+# ear.py bunu kendisi bulur (teshis: python ear.py --cuda).
+nvidia-cublas-cu12

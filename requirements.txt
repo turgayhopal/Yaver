@@ -1,0 +1,12 @@
+# Yaver - Python bagimliliklari (Python 3.11)
+# NVIDIA GPU'lu makinede ayrica: pip install -r requirements-gpu.txt
+paho-mqtt
+pyyaml
+httpx
+numpy
+sounddevice
+faster-whisper
+openwakeword
+piper-tts
+mss
+pywebview[pyside6]

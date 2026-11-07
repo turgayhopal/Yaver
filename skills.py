@@ -13,11 +13,10 @@ Kullanim:
 """
 
 import json
-from pathlib import Path
 
-import yaml
+from common import guard, load_config, mqtt_client, mqtt_connect, parse_payload
 
-CONFIG = yaml.safe_load((Path(__file__).parent / "config.yaml").read_text(encoding="utf-8"))
+CONFIG = load_config()
 
 SKILLS = {}
 
@@ -114,21 +113,26 @@ def run_skill(client, name, params):
 
 
 def main():
-    import paho.mqtt.client as mqtt
+    client = mqtt_client("yaver-skills")
+    # Son vasiyet (LWT): skills kapanirsa (Ctrl+C, cokme, main.py'nin
+    # terminate'i - hepsinde baglanti DISCONNECT'siz kopar) broker bos bir
+    # retained yuk yayinlayip arac listesini siler. brain bunu gorunce
+    # araclari LLM'e tanitmayi birakir - yoksa model olmayan bir araci
+    # cagirip zaman asimina dusuyordu.
+    client.will_set(CONFIG["skills"]["topic_list"], payload=b"", retain=True)
 
-    try:
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="yaver-skills")
-    except AttributeError:
-        client = mqtt.Client(client_id="yaver-skills")
-
+    @guard
     def on_message(client_, userdata, msg):
-        try:
-            packet = json.loads(msg.payload.decode("utf-8"))
-        except json.JSONDecodeError:
+        packet = parse_payload(msg)
+        if packet is None:
             return
         request_id = packet.get("id")
         name = packet.get("name")
+        if not request_id or not name:
+            return  # kimsenin beklemedigi bozuk istek - sonuc yayinlamanin anlami yok
         params = packet.get("params")
+        if not isinstance(params, dict):
+            params = {}
         print(f'  istek: {name}({params})')
         result = run_skill(client_, name, params)
         result["id"] = request_id
@@ -144,7 +148,7 @@ def main():
 
     client.on_connect = on_connect
     client.on_message = on_message
-    client.connect(CONFIG["mqtt"]["server"], CONFIG["mqtt"]["port"], 60)
+    mqtt_connect(client, CONFIG)
     print("Skills hazir.")
     client.loop_forever()
 
