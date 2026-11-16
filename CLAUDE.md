@@ -6,13 +6,14 @@
 sesli asistan. Jarvis benzeri ama kademeli: önce basit soru-cevap, sonra ev
 otomasyonu, en sonunda drone/derleme gibi gerçek görevler.
 
-**Şu anki aşama:** Tam zincir (duyuyor → anlıyor → cevap veriyor → konuşuyor)
-ve ilk yetenek (tool calling) katmanı Windows'ta çalıştı: Yaver bir Pico W
-kartındaki LED'i sesle yakıp söndürebiliyor (demo). Geliştirme Linux'a
-(Fedora) taşındı, LLM artık arka planda çalışan bir servis (Ollama) - kod
-platformdan ve LLM sunucusundan bağımsız hale getiriliyor. Sıradaki iş: skill
-altyapısı (uzun işler, cihaz onayı), daha fazla yetenek (saat/tarih, hafıza
-yazma), söz kesme.
+**Şu anki aşama (2026-11-16):** Tam zincir Linux'ta (Fedora, Ollama) kurulu.
+Büyük bir yenileme yapıldı, **gerçek mikrofon/hoparlörle henüz test
+edilmedi**: Claude API sağlayıcısı (`llm.provider: claude`), çok adımlı
+araç çağırma, skill altyapısı (thread havuzu, cihaz onayı, arka plan işleri),
+yeni yetenekler (saat/tarih, hesap, zamanlayıcı, hafıza, tanımlı komutlar,
+Claude Code'a iş devretme), sesli onay, söz kesme, takip penceresi
+("yaver" demeden devam), seslendirmede sentez/çalma paralelliği. Sıradaki
+iş: evde uçtan uca test, ölçüm ve ayar (bkz. "Sıradaki işler").
 
 ## Değişmez kısıtlar
 
@@ -20,10 +21,11 @@ Bunlar projenin varlık sebebi, tartışmaya açık değil:
 
 1. **İnternetsiz çalışacak.** Modeller bir kez indirilir, sonra ağ gerekmez.
    Hiçbir modül bulut API'sine bağımlı olmayacak. Tek istisna kullanıcının
-   bilinçli seçimi: `config.yaml` → `llm.provider` ileride bir internet
-   servisine (örn. `claude`) çevrilebilecek - o zaman SADECE o kullanılır.
-   Varsayılan her zaman yerel (`local`); internet servisi asla otomatik
-   devreye girmez, yerel LLM'in yedeği de değildir.
+   bilinçli seçimi: `config.yaml` → `llm.provider: claude` (Claude API) - o
+   zaman SADECE o kullanılır. Varsayılan her zaman yerel (`local`); internet
+   servisi asla otomatik devreye girmez, yerel LLM'in yedeği de değildir.
+   Aynı kural skill'ler için: internete çıkan bir skill (`delegate_task` →
+   Claude Code) `config.yaml`'da varsayılan KAPALI durur, kullanıcı açar.
 2. **Modüler olacak.** Her modül ayrı bir işlem (process). Yeni yetenek eklemek
    çekirdek koda dokunmayı gerektirmeyecek.
 3. **Taşınabilir olacak.** Kod Linux, Windows ve ileride Raspberry Pi 5'te
@@ -58,11 +60,19 @@ ear/brain/mouth üçü de yaver/status'a durumlarini yayinlar -> [face] bunu
 dinleyip masaustunun kösesinde saydam bir widget'ta gösterir (bkz. asagida).
 ```
 
-LLM, Yaver'in bir modülü değil, arka planda zaten çalışan bir servistir
-(varsayılan Ollama). `brain.py` ona OpenAI uyumlu `/v1/chat/completions`
-üzerinden bağlanır; sunucu, model ve isteğe eklenecek alanlar `config.yaml` →
-`llm` bölümündedir (`provider: local`). Ollama, llama.cpp `llama-server`,
-LM Studio... hepsi aynı kodla çalışır, Yaver hiçbirini başlatmaz.
+LLM, Yaver'in bir modülü değil, arka planda zaten çalışan bir servistir.
+`config.yaml` → `llm.provider` ikisinden birini seçer:
+- `local` (varsayılan): OpenAI uyumlu `/v1/chat/completions` (Ollama,
+  llama.cpp `llama-server`, LM Studio... hepsi aynı kodla). Yaver hiçbirini
+  başlatmaz.
+- `claude`: Anthropic Claude API (`anthropic` paketi, varsayılan model
+  `claude-haiku-5-5`). Anahtar `secrets.yaml` → `anthropic_api_key` ya da
+  `ANTHROPIC_API_KEY`. İnternet ister, ücretlidir.
+
+`brain.py`'nin iç mesaj formatı (ve `history.json`) OpenAI uyumludur;
+Claude'a giderken `to_claude_messages()` / `to_claude_tools()` çevirir.
+İki sağlayıcı da aynı `llm_turn()` arayüzünden çağrılır - geri kalan akış
+(araç döngüsü, onay, cümle akışı) sağlayıcıdan bağımsızdır.
 
 Modüller birbirinin varlığını bilmez, sadece MQTT konularını bilir.
 `common.py` modül değil, ortak bir kütüphanedir (config okuma, MQTT istemcisi,
@@ -76,6 +86,37 @@ registry'de tutar (`@skill` dekoratörü), her yeni arac ayrı bir fonksiyon,
 `skills.py`'nin çekirdeğine (MQTT akışı, `run_skill`) dokunmaz. `brain.py`
 mevcut araçları **dinamik olarak** öğrenir (`yaver/skill/list`, retained
 mesaj) — yeni bir arac eklemek `brain.py`'de kod değişikliği gerektirmez.
+
+Skill altyapısı:
+- Araçlar MQTT ağ thread'inde değil bir thread havuzunda çalışır
+  (`skills.workers`) - yavaş bir araç diğerlerini kilitlemez.
+- Her araç fonksiyonu ilk argüman olarak bir `SkillContext` alır:
+  `publish()`, `publish_and_wait()` (cihaz onayı), `notify()` (arka plan işi
+  bitti → `yaver/skill/event`).
+- Uzun işler (zamanlayıcı, `delegate_task`) hemen "başladı" döner, bitince
+  `notify()` eder; brain bunu LLM'e verip kullanıcıya söyletir.
+- `@skill(..., confirm=True)`: riskli/geri alınamaz araç. Liste mesajında
+  `"confirm": true` olarak gider, brain bu alanı LLM'e göndermeden siler.
+  LLM böyle bir aracı çağırınca brain ÇALIŞTIRMAZ, `needs_confirmation`
+  döner ve işlemi bekletir; bir sonraki cümle "evet" ise
+  (`confirmation_answer()`, karar kodda - LLM'de değil) brain aracı kendisi
+  çalıştırır, "hayır" ise iptal eder.
+- Hafızanın (`memory.json`) sahibi skills'tir (`remember`/`forget`);
+  brain dosyayı okumaz, `yaver/memory` (retained) mesajından öğrenir.
+- `run_command`: `config.yaml` → `commands`'daki ADLANDIRILMIŞ komutlar
+  (kabuksuz argüman listesi). LLM sadece adı seçer - uzaktaki kartlara ssh
+  ile erişmenin güvenli yolu budur. Komut tanımlı değilse araç hiç tanıtılmaz.
+
+Mevcut araçlar: `led_control`, `get_datetime`, `calculate`, `set_timer`,
+`cancel_timer`, `remember`, `forget`, `run_command` (komut varsa),
+`delegate_task` (açıksa - `skills.delegate`, `claude -p` çalıştırır).
+
+brain'in bir soruyu işleyişi (`ask()`): LLM ya cevap verir (cümle cümle
+hemen söylenir) ya da bir/birkaç araç çağırır → sonuçlar LLM'e verilir → LLM
+yeniden karar verir. En fazla `brain.max_tool_rounds` adım; son adımda araçlar
+kapatılır. Aynı (ad, parametre) çağrısı bir turda ikinci kez çalıştırılmaz
+(küçük model döngüye girebiliyor). Araç `brain.tool_filler_sec`'ten uzun
+sürerse bir kez "Bir saniye, bakıyorum." denir.
 
 **Cihazlar da aynı şekilde genel bir kayıt defterinden (`config.yaml` →
 `devices`) okunur.** Her cihaz bir `type` (örn. `led`), bir `label` (LLM'e
@@ -97,6 +138,7 @@ Bu şema projenin omurgası. Değiştirilecekse tüm modüller birlikte güncell
 | `yaver/speech/text` | ear → brain | `{"text": "...", "source": "ear-pc", "timestamp": 0.0}` |
 | `yaver/reply/text` | brain → mouth | `{"text": "...", "timestamp": 0.0}` |
 | `yaver/status` | her yöne | `{"module": "ear\|brain\|mouth", "status": "..."}` |
+| `yaver/control` | ear → brain, mouth | `{"command": "stop", "source": "ear"}` - söz kesme: mouth anında susar ve kuyruğu boşaltır, brain cevabı yarıda bırakır |
 
 `yaver/status` değerleri:
 - `ear` → `woke` : uyandırma kelimesi duyuldu, mouth onay çalsın
@@ -112,6 +154,11 @@ Bu şema projenin omurgası. Değiştirilecekse tüm modüller birlikte güncell
   girmesine yol açar). mouth'un MQTT son vasiyeti (LWT) de budur: mouth
   konuşurken çökerse broker "done"u onun adına yayınlar, ear sağır kalmaz.
 
+mouth, `stop` sonrası gecikmeli gelen cümleleri brain'in bir sonraki
+`thinking`/`done` durumuna kadar yutar (en fazla `barge_in.mute_sec`); ear,
+mouth'un `done`'ından sonra `wakeword.followup_sec` boyunca tetik kelimesiz
+cümle kabul eder (takip penceresi).
+
 `ear`/`brain`/`thinking`/`listening`/`idle` durumlarının tek tüketicisi
 `face.py` (masaüstü widget'ı) - ses/LLM hattına hiçbir etkisi yok, sadece
 dinler. `face.py` kapalıyken bu yayınlar hiçbir aboneye gitmez, zararsız.
@@ -122,7 +169,9 @@ Araç (skill) konuları:
 |---|---|---|
 | `yaver/skill/request` | brain → skills | `{"id": "...", "name": "...", "params": {...}}` |
 | `yaver/skill/result` | skills → brain | `{"id": "...", "name": "...", "status": "ok\|error", "data": ...}` |
-| `yaver/skill/list` | skills → brain (retained) | OpenAI uyumlu tool-schema listesi (JSON dizisi), her `skills.py` bağlantısında yayınlanır. **Boş yük** = skills kapandı (LWT ile broker yayınlar), brain araçları LLM'e tanıtmayı bırakır |
+| `yaver/skill/list` | skills → brain (retained) | OpenAI uyumlu tool-schema listesi (JSON dizisi), her `skills.py` bağlantısında yayınlanır. Riskli araçlarda ek `"confirm": true`. **Boş yük** = skills kapandı (LWT ile broker yayınlar), brain araçları LLM'e tanıtmayı bırakır |
+| `yaver/skill/event` | skills → brain | `{"name": "...", "data": ..., "timestamp": 0.0}` - arka planda biten iş (zamanlayıcı doldu, devredilen iş bitti); brain LLM'e "sistem bildirimi" olarak verip kullanıcıya söyletir |
+| `yaver/memory` | skills → brain (retained) | `{"anahtar": "değer", ...}` - kalıcı bilgiler, brain sistem promptuna ekler |
 
 `id`, brain'in eşzamanlı bekleyen istekleri sonuçla eşleştirmesi için
 (`call_skill()` bir `threading.Event` ile MQTT ağ thread'inden ayrı bir
@@ -135,12 +184,15 @@ bölümünde tanımlı — bkz. yukarıdaki genel cihaz kayıt defteri açıklam
 | Konu | Yön | Yük |
 |---|---|---|
 | `yaver/device/pico_led_masa` | skills → Pico W (`boards/pico_w`) | düz metin: `"on"` / `"off"` |
+| `yaver/device/pico_led_masa/state` | Pico W → skills (retained) | düz metin: uygulanan durum `"on"` / `"off"` - cihaz onayı (`devices.*.ack_topic`). skill `skills.device_ack_timeout_sec` içinde göremezse hata döner, Yaver "cihaz cevap vermedi" der |
 
 ## Dosya düzeni
 
 ```
 yaver/                     (proje kökü - konumu önemsiz, yollar buna göre çözülür)
 ├── config.yaml            TÜM ayarlar. Platforma özel her şey burada.
+├── secrets_example.yaml   kimlik bilgisi şablonu (API anahtarı, MQTT şifresi) -
+│                          secrets.yaml olarak kopyalanır, o dosya gitignore'da
 ├── common.py              ortak kütüphane (config, MQTT istemcisi, güvenli yük
 │                          çözme) - modül değil, süreç olarak çalışmaz
 ├── main.py                skills/brain/mouth/ear/face'i tek komuttan baslatan
@@ -177,8 +229,10 @@ python main.py
 ```
 
 Önce arka planda iki servis çalışıyor olmalı (Yaver bunları başlatmaz):
-**MQTT broker** (Mosquitto) ve **LLM sunucusu** (varsayılan Ollama,
-`ollama pull qwen3:4b-instruct`). `main.py`, `config.yaml`'daki `launcher`
+**MQTT broker** (Mosquitto, `sudo systemctl enable --now mosquitto`) ve
+**LLM sunucusu** (varsayılan Ollama, `ollama pull qwen3:4b-instruct`) -
+`llm.provider: claude` seçiliyse Ollama gerekmez, internet ve `secrets.yaml`
+gerekir. `main.py`, `config.yaml`'daki `launcher`
 bolumunu okuyup skills/brain/mouth/ear/face'i AYNI ANDA, her biri kendi ayri
 surecinde baslatir - modullerin birbirini tanimasi/dogrudan cagirmasi ilkesi
 bozulmaz. Açılışta broker'a ulaşamazsa durur (hiçbir modül bağlanamaz), LLM'e
@@ -205,8 +259,39 @@ Fedora'da: `sudo firewall-cmd --add-port=1883/tcp --permanent && sudo firewall-c
 Windows notu: Wi-Fi ağı "Public" sınıflandırılırsa Private-only kural uygulanmaz
 (`Set-NetConnectionProfile -NetworkCategory Private`).
 
+### Mosquitto kimlik doğrulama (riskli yeteneklerden önce yapılmalı)
+
+Broker kimlik doğrulamasız olduğu sürece ağdaki herkes `yaver/skill/request`'e
+yazıp araçları (komutlar, `delegate_task`) doğrudan çalıştırabilir - brain'in
+sesli onayı bu yolu kapatmaz. Kod hazır, sistem ayarı kullanıcıda (sudo):
+
+```bash
+sudo mosquitto_passwd -c /etc/mosquitto/passwd yaver     # şifre sorar
+# /etc/mosquitto/mosquitto.conf:
+#   listener 1883 0.0.0.0
+#   allow_anonymous false
+#   password_file /etc/mosquitto/passwd
+sudo systemctl restart mosquitto
+```
+
+Sonra `config.yaml` → `mqtt.username: yaver`, `secrets.yaml` →
+`mqtt_password: ...`, Pico'da `secrets.py` → `MQTT_USER`/`MQTT_PASSWORD`.
+
 ### LLM sunucusu notları (yaşanmış, ölçülmüş)
 
+- **Bağlam boyutu (2026-11-16, ölçüldü):** Ollama 0.40'ın varsayılan bağlamı
+  bu makinede 16384 - model 6 GB'a sığmadı, %29'u CPU'da çalıştı, ilk cümle
+  1-4 sn'ye çıktı. `/v1` uç noktası `num_ctx`'i yok saydığından ayar modelin
+  kendisinde: `ollama create yaver-qwen3-4b -f ollama/yaver-qwen3-4b.Modelfile`
+  (qwen3:4b-instruct + `num_ctx 4096`), `config.yaml` → `llm.local.model:
+  yaver-qwen3-4b`. Yeni makinede bu komut bir kez çalıştırılmalı.
+- **VRAM'i masaüstü uygulamaları da kullanıyor:** ölçümde Blender, Opera,
+  VS Code vb. açıkken Ollama'ya ~2,3 GB kaldı, 4096 bağlamda bile modelin
+  %16'sı CPU'daydı. Sonuç (12 soruluk test): sohbet cevabında ilk cümle
+  0,5-1,3 sn, araçlı cevapta 2,2-3,2 sn (araç kararı JSON'u CPU'da yavaş
+  üretiliyor), hafıza değişince ilk soru 7 sn (sistem promptu değişti,
+  önbellek yeniden). Araç seçimi 8/8 doğruydu. Hızlı yerel cevap için GPU'yu
+  kullanan uygulamaları kapat ya da `provider: claude`.
 - **Model:** Ollama'daki düz `qwen3:4b` "düşünen" (thinking) sürüm - ölçüldü:
   sohbet sorusunda 900 token düşünüp hiç cevap vermedi (26 sn), araç çağrısı
   16 sn sürdü; düşünme kapatılınca (`reasoning_effort: none`) İngilizce
@@ -240,8 +325,8 @@ python find_microphone.py       # cihazları listele
 | Katman | Araç | Not |
 |---|---|---|
 | Uyandırma | openWakeWord, `hey_jarvis` modeli | özel "Yaver" modeli henüz eğitilmedi |
-| Konuşma tanıma | faster-whisper, `small` model | GPU/int8_float16, ~0.5 sn |
-| LLM | Ollama (arka plan servisi) + `qwen3:4b-instruct` | OpenAI uyumlu `/v1/chat/completions`, port 11434; `config.yaml` → `llm`. Sunucu değiştirilebilir (llama.cpp ile Windows'ta ~55 tok/sn ölçülmüştü) |
+| Konuşma tanıma | faster-whisper, `small` model | GPU/int8_float16. Ölçüldü (2026-11-16, Piper sesiyle 8 cümle, GTX 1660): `small` 0,30 sn/cümle 5/8 birebir; `medium` 0,73 sn 6/8 (Raspberry Pi gibi özel adlarda daha iyi); `large-v3-turbo` 1,11 sn 4/8 - kullanma. Gerçek sesle fark büyükse `medium` dene |
+| LLM | Ollama (arka plan servisi) + `qwen3:4b-instruct` ya da Claude API (`claude-haiku-5-5`) | `config.yaml` → `llm.provider`. Yerel: OpenAI uyumlu `/v1/chat/completions`, port 11434. Claude: `anthropic` SDK, adaptive thinking + `effort: low` (Haiku 5.5 `temperature` kabul etmiyor - gönderilmez) |
 | Seslendirme | Piper, `tr_TR-dfki-medium` | onay cümleleri açılışta önceden sentezlenir, `mouth.synthesis` (config.yaml) ile ayarlanmış (bkz. asağıdaki not) |
 | Mesajlaşma | Mosquitto (MQTT), 1883 | LAN'a açık olmalı (kimlik doğrulamasız, ev ağı) - fiziksel cihazlar da bağlanabilsin diye. Linux'ta henüz sadece 127.0.0.1 |
 | Araç çağırma | OpenAI uyumlu `tools` (Ollama / llama.cpp) | `brain.py`'de karar turu da stream'li (bkz. `stream_decision`) - arac gerekmezse ilk cumle hemen soylenir |
@@ -287,6 +372,12 @@ python find_microphone.py       # cihazları listele
   arka ucu saydamligi desteklemiyor) - bu yuzden `pywebview[pyside6]` gerekir.
   Qt'ye ozel ortam degiskenleri (orn. Wayland'de `QT_QPA_PLATFORM`) kodda degil
   `face.env`'de.
+- **Kimlik bilgileri `secrets.yaml`'da** (`common.secret()` okur, yoksa
+  ortam değişkeni). `config.yaml` git'te - içine anahtar/şifre yazılmaz.
+- **Claude'un thinking blokları geçmişe yazılmaz.** Sadece süren bir araç
+  döngüsünde (`claude_content`) aynen geri gönderilir. Geçmiş blok halinde
+  kırpılınca ya da sistem promptu (hafıza, araç listesi) değişince eski
+  bloklar "geçmiş değişti" kontrolüne takılıp 400 verirdi.
 - **`brain.py`'nin sistem promptu ve `question` metni turlar arası birebir
   sabit kalmalı** (saat, hava durumu gibi değişken içerik YOK). LLM sunucusu
   isteğin ortak önekini (system prompt + geçmiş) önbelleğe alıyor; içeriklerden
@@ -336,6 +427,16 @@ cümle cümle akışlı seslendirme, ağız konuşurken kulağın susması, kal�
 konuşma geçmişi, arac cagirma (Pico W LED demo uctan uca calisiyor), masaustu
 durum widget'i (`face.py` - bosta/dinliyor/dusunuyor/konusuyor).
 
+**2026-11-16 yenilemesinde doğrulanan (mikrofonsuz):** 40 birim testi (araç
+döngüsü, onay akışı, tekrar süzgeci, Claude mesaj çevirisi, sahte HTTP
+sunucusuyla Claude stream + thinking bloklarının geri gönderilmesi); skills
+gerçek Mosquitto üzerinden (sahte Pico ile LED onayı ve onay gelmeyince 2 sn
+sonra hata, saat, hesap, `run_command`, zamanlayıcı bildirimi, hafıza);
+brain + skills + Ollama 12 soruluk uçtan uca test (yukarıdaki ölçümler).
+**Doğrulanmadı:** gerçek Claude API (anahtar yoktu - sadece sahte sunucu),
+söz kesme ve takip penceresi (mikrofon/hoparlör gerekir), yeni Pico kodu
+(kart gerekir), mouth'un yeni sentez/çalma thread'leri hoparlörde.
+
 **Linux'ta doğrulanan (Fedora, Ollama):** brain + skills uçtan uca (gerçek
 Mosquitto + Ollama ile soru-cevap, LED aracı, bozuk mesajlar, skills kapanınca
 araçların kalkması), Whisper GPU'da (Piper sesiyle beslenerek), Piper sentezi,
@@ -368,55 +469,51 @@ Aynı motor, aynı hız, sadece daha net/temiz telaffuz. `mouth.py`'nin
 `synthesize()` fonksiyonu bunu okuyup `voice.synthesize(text, syn_config=...)`
 ile kullanıyor.
 
+**Sistem promptu (2026-11-16 yeniden yazıldı):** eski prompt neredeyse
+tamamen yasaklardan ("ASLA", "uydurma", "bilmiyorsan söyle") oluşuyordu ve
+Yaver'in ne yapabildiğini hiç söylemiyordu - küçük model "Bilmiyorum...
+Lütfen daha net sor." kaçışını öğrenmişti. Yeni prompt kimliği, konuşma
+tarzını, araçları ve **metnin konuşma tanımadan hatalı gelebileceğini**
+(en olası anlamı tahmin et) anlatıyor. Örnek cümle olarak "Ben Yaver'im"
+yazılmıyor - model her cevaba onunla başlıyordu. Ayrıca kod tarafında
+tekrar süzgeci var (`is_repeat()`, `brain.repeat_window_turns`).
+
+**history.json kötü kalıpları taşır:** model geçmişteki kendi cümlelerini
+taklit ettiği için kötü bir oturumun `history.json`'u yeniden başlatmada da
+etkisini sürdürür. Cevaplar tuhaflaşırsa önce bu dosyayı sil.
+
 **Bilinen sorunlar:**
 
-1. **Sözü kesilemiyor.** Mouth konuşurken ear tamamen sağır. Çözüm: mouth
-   konuşurken ear sadece uyandırma kelimesini dinlesin, duyarsa `sd.stop()`.
-2. **Özel "Yaver" uyandırma modeli henüz eğitilmedi.** Şimdilik gerekmiyor
-   (yukarıdaki metin-içi tetik moduyla "Yaver" ismi zaten çalışıyor); sadece
-   `wakeword.enabled: true` moduna dönülmek istenirse gerekir.
-3. **Metin-içi tetik, niyet ayrımı yapmaz.** "Yaver" kelimesi asistana değil
-   üçüncü şahıs olarak söylense bile (örn. birine "Yaver bugün çalışmadı"
-   derken) yine tetiklenir. Hem bu modda hem openWakeWord modunda ortak,
-   çözülmemiş bir sınırlama.
+1. **Söz kesme gerçek hoparlörle denenmedi.** ear, Yaver konuşurken
+   `barge_in.threshold_multiplier` kat yüksek sesi kaydedip Whisper'a verir,
+   cümlede tetik kelime + dur kelimesi varsa durdurur. Yankı engelleme (AEC)
+   yok: hoparlör yüksekse ve mikrofon yakınsa eşik ayarı gerekebilir. Sadece
+   metin-içi tetik modunda (`wakeword.enabled: false`).
+2. **Özel "Yaver" uyandırma modeli henüz eğitilmedi.** Şimdilik gerekmiyor;
+   sadece `wakeword.enabled: true` moduna dönülmek istenirse gerekir.
+3. **Metin-içi tetik, niyet ayrımı yapmaz.** "Yaver" üçüncü şahıs olarak
+   söylense de tetiklenir. Takip penceresi (`followup_sec`) bunu biraz artırır:
+   Yaver konuştuktan sonraki birkaç saniyede odadaki her cümle ona gider.
+4. **Küçük yerel model (4B) sınırlı.** Türkçe sohbette ve araç seçiminde
+   Claude'un belirgin gerisinde; bazen aracı çağırmadan "yaptım" diyebilir.
+5. **Mosquitto hâlâ kimlik doğrulamasız ve sadece 127.0.0.1'de** (bkz.
+   yukarıda "Mosquitto kimlik doğrulama"). Pico bağlanamaz.
 
 ## Sıradaki işler (öncelik sırasıyla)
 
-1. **Skill altyapısı** — bunlar yeni yeteneklerden ÖNCE gerekli:
-   - `skills.py` araçları MQTT ağ thread'inde, senkron çalıştırıyor ve brain
-     en fazla `skills.timeout_sec` (5 sn) bekliyor - uzun süren bir iş
-     (zamanlayıcı, derleme, drone) hem diğer istekleri kilitler hem zaman
-     aşımına düşer. Araçlar ayrı bir thread'e taşınmalı, uzun işler için
-     "başladım → bitince haber ver" deseni kurulmalı.
-   - `led_control` mesajı yayınlar yayınlamaz "ok" dönüyor, cihazdan onay
-     beklemiyor - Pico kapalıyken de Yaver "yaktım" der. Cihazlar bir onay
-     (ack) konusu yayınlamalı, skill onu beklemeli.
-   - Pico W kodu broker kapalıyken (açılışta ya da yeniden bağlanırken) çöküyor,
-     kart elle yeniden başlatılana kadar ölü kalıyor.
-   - brain sadece İLK araç çağrısını işliyor, ardından ikinci bir araç turu
-     yok ("ikisini de kapat" denince biri sessizce atlanır).
-2. **Daha fazla yetenek (skill)** — saat/tarih, basit hesap, zamanlayıcı, drone
-   kontrolü, proje derleme. Her biri yeni bir `@skill` fonksiyonu. **Saat/tarih
-   eklenirken sistem promptundaki "tarih/saat hakkında HİÇBİR bilgin yok"
-   kuralı da araca yönlendirecek şekilde değişmeli** (yoksa model aracı
-   çağırmak yerine bilmediğini söyler).
-3. **Hafıza yazma** — "Yaver, adımın Mehmet olduğunu hatırla" → `memory.json`.
-   Bunu da bir yetenek (skill) olarak yap, beyne gömme.
-4. **Söz kesme** (yukarıdaki 1. sorun).
-5. **Gerçek dünya etkisi olan yetenekler için onay adımı** — drone kontrolü ya
-   da proje derleme gibi geri alınamaz/riskli eylemlerden önce sesli onay
-   ("Emin misin?") istemek. Broker kimlik doğrulamasız olduğu sürece ağdaki
-   herkes `yaver/skill/request`'e doğrudan yazıp bu onayı atlayabilir - riskli
-   yeteneklerden önce Mosquitto'ya kimlik doğrulama + ACL eklenmeli.
-6. **İnternet LLM sağlayıcısı (isteğe bağlı)** — `llm.provider: claude` (ya da
-   başka bir servis) seçilince brain SADECE onu kullansın. Yerel `local`
-   varsayılan kalır; internet servisi otomatik devreye girmez.
-7. **Özel "Yaver" uyandırma modeli** — düşük öncelik, gerekmedikçe ertelendi
-   (bkz. yukarıdaki "Uyandırma modu" bölümü).
-8. **Pi 5'e taşıma** — `config.yaml`'da cihaz/model değişiklikleri,
-   `whisper.device: cpu`, daha küçük LLM. Kod değişmemeli; değişmesi gerekiyorsa
-   o bir tasarım hatasıdır, önce onu düzelt. Mosquitto'nun LAN listener +
-   firewall ayarları da yeni ortamda tekrarlanmalı.
+1. **Evde uçtan uca test** (`python main.py`, gerçek mikrofon/hoparlör):
+   akıcılık, ilk cümle gecikmesi (yerel vs Claude), söz kesme eşiği, takip
+   penceresi, LED onayı (Pico yeni `boards/pico_w/main.py` ile yüklenmeli).
+2. **Mosquitto kimlik doğrulama + LAN listener**, sonra `run_command`'a
+   gerçek ssh komutları ve gerekirse `delegate_task`'ı açmak.
+3. **Whisper modeli** - ölçüm sonucuna göre (bkz. Teknoloji yığını) `small`
+   yerine daha büyük model.
+4. **Daha fazla yetenek** - drone kontrolü, ev otomasyonu cihazları (yeni
+   `type` + yeni `@skill`).
+5. **Özel "Yaver" uyandırma modeli** - düşük öncelik.
+6. **Pi 5'e taşıma** - `config.yaml`'da cihaz/model değişiklikleri,
+   `whisper.device: cpu`, daha küçük LLM ya da `provider: claude`. Kod
+   değişmemeli; değişmesi gerekiyorsa o bir tasarım hatasıdır.
 
 ## Yapılmayacaklar
 

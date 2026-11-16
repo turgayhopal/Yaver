@@ -9,6 +9,9 @@ mqtt:
   topic_text: yaver/speech/text
   topic_reply: yaver/reply/text
   topic_status: yaver/status
+  topic_control: yaver/control  # ear -> brain/mouth: {"command": "stop"} (soz kesme)
+  username: null              # Mosquitto kimlik dogrulamasi acilinca kullanici adi (sifre secrets.yaml'da
+                              # mqtt_password). null = anonim. Bkz. CLAUDE.md "Mosquitto kimlik dogrulama"
 
 face:
   # Masaustu widget'i (face.py) - yaver/status'u dinleyip kucuk, her seyin
@@ -34,8 +37,33 @@ skills:
   topic_request: yaver/skill/request   # brain -> skills: {"id","name","params"}
   topic_result: yaver/skill/result     # skills -> brain: {"id","name","status","data"}
   topic_list: yaver/skill/list         # skills -> brain: mevcut araclarin listesi (retained)
-  timeout_sec: 5.0                     # bir arac cagrisinin sonucu icin en fazla bekleme
+  topic_event: yaver/skill/event       # skills -> brain: arka planda biten is (zamanlayici, delegate_task)
+  topic_memory: yaver/memory           # skills -> brain (retained): kalici bilgiler (memory.json'un sahibi skills)
+  timeout_sec: 30.0                    # brain bir arac sonucunu en fazla bu kadar bekler (komutlar/ssh icin uzun;
+                                       # cihaz onayi kendi kisa suresiyle - device_ack_timeout_sec - biter)
   list_wait_sec: 2.0                   # brain acilista LLM'i isitmadan once arac listesini en fazla bu kadar bekler
+  workers: 4                           # araclar bu kadar thread'de paralel calisir (MQTT ag thread'i hic bloklanmaz)
+  device_ack_timeout_sec: 2.0          # cihaz (orn. Pico) "yaptim" onayini en fazla bu kadar bekle, yoksa hata
+  command_timeout_sec: 20              # run_command: bir komutun varsayilan en uzun suresi
+  output_max_chars: 1500               # komut/ajan ciktisi LLM'e en fazla bu kadar verilir
+  timer_max_sec: 86400                 # en uzun zamanlayici (1 gun)
+  memory_file: memory.json             # remember/forget'in yazdigi kalici hafiza (goreli = proje koku)
+  delegate:
+    # delegate_task: karmasik isi (kod yazma, derleme, uzak sunucuda inceleme)
+    # arka planda Claude Code'a devreder. INTERNET ISTER ve gercek dunyada
+    # etki eder (dosya yazar, komut calistirir) - bu yuzden varsayilan kapali,
+    # acilinca her cagri sesli onay ister. Acmadan once: Mosquitto kimlik
+    # dogrulamasi (yoksa ag'daki herkes yaver/skill/request'e yazabilir).
+    enabled: false
+    workdir: "~"                       # ajanin calisacagi klasor (goreli = proje koku, ~ = ev dizini)
+    timeout_sec: 900
+    command:                           # sonuna gorev metni eklenir. Kabuk YOK, arguman listesi.
+      - claude
+      - -p
+      - --append-system-prompt
+      - "Sonucu Türkçe, en fazla üç kısa cümleyle özetle; sesli okunacak. Markdown ve kod bloğu kullanma."
+      - --permission-mode
+      - acceptEdits                    # dosya duzenleyebilir; Bash vb. icin --allowedTools ile acikca izin ver
 
 devices:
   # Genel cihaz kayit defteri - burada tanimli her cihaz, ayni "type"a sahip
@@ -47,6 +75,27 @@ devices:
     type: led                          # skill'lerin cihazi filtrelemek icin kullandigi tur etiketi
     label: "masadaki Pico W'nin dahili LED'i"  # LLM'e gosterilir, "hangi cihaz" ayrimini bununla yapar
     topic: yaver/device/pico_led_masa    # bu cihaz bu konuyu dinler, "on"/"off" payload'u bekler
+    ack_topic: yaver/device/pico_led_masa/state  # cihaz uyguladigi durumu buraya yazar; skill bunu bekler.
+                                                 # Satiri silersen eski davranis: onay beklenmez
+
+commands:
+  # run_command araci: onceden tanimli, ADLANDIRILMIS komutlar. LLM sadece adi
+  # secer, komutu kendisi yazamaz. Uzaktaki kartlara erisim icin ssh kullan
+  # (anahtarla, sifresiz giris: ssh-copy-id), orn:
+  #   pi_sicaklik:
+  #     label: "Raspberry Pi'nin işlemci sıcaklığını söyler"
+  #     command: [ssh, -o, ConnectTimeout=5, pi@192.168.1.50, vcgencmd, measure_temp]
+  #   pi_yeniden_baslat:
+  #     label: "Raspberry Pi'yi yeniden başlatır"
+  #     command: [ssh, pi@192.168.1.50, sudo, reboot]
+  #     confirm: true            # geri alinamaz: sesli onay ister
+  # Komutlar platforma ozeldir - bu yuzden kodda degil burada.
+  pc_uptime:
+    label: "Bu bilgisayarın ne kadar süredir açık olduğunu söyler"
+    command: [uptime, -p]
+  pc_disk:
+    label: "Bu bilgisayarın disk doluluğunu söyler"
+    command: [df, -h, --output=pcent,target, /, /home]
 
 launcher:
   # main.py'nin tek komuttan baslattigi surecler. Her biri hala AYRI bir
@@ -68,14 +117,30 @@ llm:
   # model/sunucu adi yok - degistirmek icin sadece burayi duzenle.
   #   local: OpenAI uyumlu /v1/chat/completions sunan yerel bir sunucu
   #          (Ollama, llama.cpp llama-server, LM Studio...) - internet gerekmez.
-  #   (ileride: claude / baska bir internet servisi - henuz yok)
+  #   claude: Anthropic Claude API - INTERNET ISTER, ucretli, API anahtari
+  #           secrets.yaml'da (anthropic_api_key) ya da ANTHROPIC_API_KEY'de.
+  #           Bilincli secimdir: secilince SADECE o kullanilir, yerel model
+  #           yedek degildir (bkz. CLAUDE.md degismez kisit 1).
   provider: local
+  warm_up: true                      # brain acilista LLM'i isitsin (local: modeli yukleyip promptu
+                                     # onbellege alir; claude: baglantiyi acip anahtari dogrular)
+  claude:
+    model: claude-haiku-5-5          # en hizli/ucuz Claude - sesli asistan icin gecikme oncelikli.
+                                     # Daha zeki ama daha yavas: claude-sonnet-5-5
+    max_tokens: 1024                 # dusunme (thinking) de bu sinira dahil - cevabin kisaligi promptta
+    timeout_sec: 60
+    max_retries: 1
+    request_options:                 # her istege eklenecek alanlar
+      thinking: {type: adaptive}     # model gerekirse kisaca dusunur, basit soruda dusunmez
+      output_config: {effort: low}   # low = en hizli. Cevaplar yetersizse medium dene
+                                     # (temperature GONDERILMEZ - Haiku 5.5 reddediyor)
   local:
     server: http://127.0.0.1:11434  # Ollama varsayilani. llama.cpp icin orn. :8080.
                                      # "localhost" degil bilerek - bazi sistemlerde IPv6 (::1)
                                      # once denenip zaman asimina ugruyor, her istege ~2 sn
                                      # sabit gecikme ekliyordu (Windows'ta olculdu)
-    model: qwen3:4b-instruct         # duz "qwen3:4b" DEGIL - o dusunen (thinking) surum, sesli
+    model: yaver-qwen3-4b            # = qwen3:4b-instruct + num_ctx 4096 (ollama/yaver-qwen3-4b.Modelfile).
+                                     # duz "qwen3:4b" DEGIL - o dusunen (thinking) surum, sesli
                                      # asistan icin cok yavas ve Ingilizce muhakeme sizdiriyor
                                      # (olculdu, bkz. CLAUDE.md "LLM sunucusu notlari")
     request_options:                 # her istege eklenecek ek alanlar (sunucuya ozel)
@@ -87,8 +152,6 @@ llm:
                                      # baglam boyutu sunucu tarafinda (OLLAMA_CONTEXT_LENGTH,
                                      # varsayilan 4096 - sistem promptu + 4 tur gecmis icin yeterli)
     timeout_sec: 120                 # bir LLM isteginin en fazla suresi
-    warm_up: true                    # brain acilista modeli yukleyip sistem promptunu onbellege alsin
-                                     # (yoksa ilk gercek soru soguk yuklemeyi bekler)
 
 brain:
   history_turns: 4        # kac konusma turu hatirlansin. Kucuk model uzun gecmiste
@@ -98,49 +161,56 @@ brain:
   history_trim_to: 2        # sinir asilinca gecmis bu kadar tura indirilir (tek tek kaydirilmaz).
                             # Her turda kaydirmak LLM onbellegini her soruda bozup gecmisin
                             # tamamini yeniden isletiyordu (olculdu: +0,6 sn/soru). Bkz. add_turn()
-  temperature: 0.4
-  max_tokens: 160           # sesli cevap kisa olmali
-  stream: true              # cumle biter bitmez seslendir (gecikmeyi yariya indirir)
+  temperature: 0.4         # sadece local (Claude'a gonderilmez)
+  max_tokens: 160           # sadece local - sesli cevap kisa olmali (Claude: llm.claude.max_tokens)
   min_sentence_chars: 12    # bundan kisa cumle ("Tamam.") tek basina seslendirilmez, sonrakiyle birlesir
+  max_tool_rounds: 3        # bir soruda en fazla kac arac adimi ("ikisini de kapat", "saati soyle
+                            # ve zamanlayici kur"). Sonra araclar kapatilip cevap istenir
+  repeat_window_turns: 3    # son bu kadar cevapta birebir gecen cumle tekrar soylenmez (ilk cumle haric)
+  confirm_timeout_sec: 30   # riskli arac icin "Onayliyor musun?" sorusunun gecerlilik suresi
+  tool_filler_sec: 1.5      # arac bu sureden uzun surerse bir kez tool_filler soylenir (sessizlik olmasin)
+  tool_filler: "Bir saniye, bakıyorum."
+  llm_error_reply: "Beynime ulaşamıyorum, bağlantıda bir sorun var."
   system_prompt: |
-    Sen Yaver adında, Türkçe konuşan bir sesli asistansın.
-    Cevapların SESLİ okunacak, bu yüzden:
-    - Kısa konuş. En fazla 2-3 cümle.
-    - Madde işareti, başlık, kod bloğu KULLANMA. Emoji ASLA kullanma, sesli
-      okunamaz.
-    - Sayıları rakam yerine yazıyla yaz (2025 değil, iki bin yirmi beş).
-    - Bilmiyorsan bilmediğini söyle, uydurma.
-    - Şu anki tarih, saat ve hava durumu hakkında HİÇBİR bilgin yok. Sorulursa
-      bilmediğini söyle, ASLA tarih veya hava tahmini uydurma.
-    - Bir cihazı değiştirmen istendiğinde (örn. LED aç/kapat) SADECE ilgili
-      aracı gerçekten çağırarak yapabilirsin. Aracı çağırmadan "yaptım",
-      "açıldı", "söndü" gibi bir şeyi başardığını ASLA söyleme - önceki
-      konuşmada bir araç çağırmış olman, şimdiki istek için de çağırmana
-      gerek olmadığı anlamına gelmez, her istek için ayrı ayrı çağır. Aşağıdaki
-      konuşma geçmişinde bir önceki LED isteğinde araç çağırmadan cevap
-      verilmiş gibi görünse bile SEN yine de gerçekten çağır - geçmişi
-      TAKLİT ETME, bu bir hataydı.
-    - Bir aracın "hangi cihaz" seçeneği (device gibi) varsa ve kullanıcı
-      hangisini kastettiğini belirtmediyse ya da net değilse: ASLA tahmin
-      etme, rastgele bir cihaz seçme, veya aracı hiç çağırmadan başardığını
-      söyleme - bunun yerine kullanıcıya hangi cihazı kastettiğini sor.
-    - Kendinden bahsederken HER ZAMAN birinci şahıs kullan: "Ben Yaver'im",
-      "Adım Yaver". ASLA "sen Yaver" ya da "ben sen Yaver" gibi ikinci ve
-      birinci şahsı karıştıran bozuk bir cümle kurma.
-    - Sadece sorulana cevap ver ve cevap bitince dur. Duygu, sevgi ya da
-      nezaket bildiren kapanış cümlesi ekleme. Bir aracı çağırıp işlemi
-      tamamladıysan (örn. LED açtın) SADECE ne yaptığını kısaca söyle.
-    - Konuşma geçmişindeki kendi eski cevaplarını tekrarlama, her soruya
-      yeniden ve kısaca cevap ver.
-    - Türkçe karakterleri (ç, ğ, ı, ö, ş, ü, İ, Ç, Ğ, Ö, Ş, Ü) HER ZAMAN doğru
-      kullan - "baska" değil "başka", "gunes" değil "güneş" yaz. Şapkasız
-      (ASCII) yazım hem yanlış görünür hem sesli okunurken yanlış telaffuz
-      edilir.
+    Sen Yaver'sin: evdeki bilgisayarda çalışan, Türkçe konuşan bir sesli asistan.
+    Kullanıcıyla sesli konuşuyorsun; söylediğin her şey hoparlörden okunuyor.
+    Samimi, doğal ve yardımsever konuş; bir arkadaş gibi, ama lafı uzatmadan.
+
+    Kullanıcının sözleri konuşma tanıma sisteminden yazıya çevrilip sana
+    geliyor, bu yüzden metinde yanlış duyulmuş kelimeler olabilir ("koldu"
+    aslında "kod", "Ya var" aslında "Yaver" olabilir). Cümlenin en olası
+    anlamını tahmin et ve ona göre cevap ver. Anlam gerçekten çıkarılamıyorsa
+    neyi anlamadığını tek cümleyle sor.
+
+    Nasıl konuşursun:
+    - Genelde bir iki cümle; konu gerektiriyorsa en fazla dört cümle.
+    - Sadece düz konuşma metni: madde işareti, başlık, kod, tablo, emoji yok.
+    - Sayıları, saatleri ve tarihleri yazıyla yaz ("on dört otuz", "üç derece").
+    - Türkçe karakterleri her zaman doğru kullan (ç, ğ, ı, ö, ş, ü).
+    - Kendinden birinci şahısla bahset. Cevabına "Ben Yaver" diye başlama,
+      kendini sadece sorulursa tanıt.
+    - Soruyu cevaplayınca dur; kapanış nezaketi ya da "başka bir şey var mı"
+      gibi dolgu cümleleri ekleme. Önceki cevaplarını kelimesi kelimesine
+      tekrarlama.
+
+    Araçların:
+    - Sana tanıtılan araçlarla gerçek işler yapabilirsin: cihaz kontrolü,
+      saat ve tarih, hesap, zamanlayıcı, hafızaya yazma ve tanımlı komutlar.
+      İş bir araçla yapılabiliyorsa aracı çağır; yapılamıyorsa bunu açıkça söyle.
+    - Saat, tarih ve gün bilgisini sadece get_datetime aracından al, asla tahmin etme.
+    - Bir işi yaptığını sadece aracı bu istek için gerçekten çağırdıysan ve sonuç
+      başarılıysa söyle. Araç hata döndürdüyse ne olduğunu kısaca anlat. Geçmişte
+      aynı işi yapmış olman yeterli değil; her istekte aracı yeniden çağır.
+    - Hangi cihazın kastedildiği belli değilse tahmin etme, sor.
+    - Araç sonucu "needs_confirmation" ise işlem henüz yapılmadı: ne yapacağını
+      söyleyip onay iste.
+    - Bilmediğin bir bilgiyi uydurma. Güncel olaylar ya da internet bilgisi
+      gerekiyorsa erişimin olmadığını söyle.
 
   no_tools_note: |          # skills kapaliyken (hic arac yokken) sistem promptuna eklenir
-    - ŞU AN HİÇBİR CİHAZI KONTROL EDEMİYORSUN, araçların kapalı. Bir cihaz
-      (LED, ışık vb.) değiştirmen istenirse bunu şu an yapamadığını kısaca
-      söyle. ASLA "yaktım", "söndürdüm" gibi yapmış gibi konuşma.
+    ŞU AN ARAÇLARIN KAPALI: hiçbir cihazı kontrol edemiyorsun, saati de
+    bilmiyorsun. Böyle bir şey istenirse şu an yapamadığını kısaca söyle;
+    yapmış gibi konuşma.
 
 mouth:
   voice_model: voices/tr_TR-dfki-medium.onnx   # goreli yol = proje kokune gore
@@ -174,8 +244,19 @@ wakeword:
   model: hey_jarvis         # enabled: true iken kullanilir. kendi "Yaver" modelini sonra egitecegiz
   threshold: 0.5            # dusurursen daha kolay uyanir ama yanlis alarm artar
   cooldown_sec: 2.0         # uyandiktan sonra tekrar dinlemeye gecis beklemesi
+  followup_sec: 6.0         # Yaver konusmayi bitirdikten sonra bu kadar sure "yaver" demeden devam
+                            # edilebilir ("Onayliyor musun?" -> "evet"). 0 = kapali, her cumlede "yaver" gerekir
   ack_wait_sec: 3.0         # "efendim" bitene kadar en fazla bu kadar bekle
   ack_tail_sec: 0.15        # "efendim" bittikten sonra hoparlorun tamamen susmasi icin pay
+
+barge_in:
+  # Soz kesme: Yaver konusurken "Yaver dur" / "Yaver sus" denince susar.
+  # Hoparlor sesi mikrofona da girdigi icin konusma esigi bu sirada yukseltilir
+  # ve cumlede HEM tetik kelime HEM bir dur kelimesi gecmesi gerekir.
+  enabled: true
+  threshold_multiplier: 2.0 # Yaver konusurken konusma esigi bu kadar katina cikar (hoparlor yankisi)
+  stop_words: [dur, sus, yeter, kes, sessiz, sesiz]
+  mute_sec: 3.0             # durduktan sonra yarim kalan cevabin gec gelen cumleleri en fazla bu kadar yutulur
 
 recording:
   silence_multiplier: 2.5   # ortam gurultusunun kac kati "konusma" sayilsin
@@ -192,7 +273,7 @@ whisper:
   device: cuda                 # Pi'de: cpu
   compute_type: int8_float16   # GTX 1660'ta Tensor Core yok, float16 yavas/duzensiz calisiyordu. Pi'de: int8
   language: tr
-  hotwords: "Yaver LED"        # nadir/yabanci kelimeler icin Whisper'a ipucu (yanlis duymayi azaltir).
+  hotwords: "Yaver LED kod yazılım zamanlayıcı"  # nadir/yabanci kelimeler icin Whisper'a ipucu (yanlis duymayi azaltir).
                                 # yeni bir skill nadir bir kelime/isim kullanirsa buraya da ekle
   beam_size: 1                 # 1 = en hizli (greedy). Artirmak isabeti biraz artirir, yavaslatir
   temperature: 0.0

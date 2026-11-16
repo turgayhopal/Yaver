@@ -1,0 +1,7 @@
+# Yaver icin qwen3:4b-instruct - baglam 4096'ya sabitlenir.
+# Neden: Ollama'nin varsayilan baglami (bu makinede 16384) modeli 6 GB VRAM'e
+# sigdirmiyor, %29'u CPU'da calisiyordu - ilk cumle 0,4 sn -> 1-4 sn (olculdu).
+# /v1/chat/completions num_ctx'i yok saydigi icin ayar modelin kendisinde.
+# Kurulum (bir kez):  ollama create yaver-qwen3-4b -f ollama/yaver-qwen3-4b.Modelfile
+FROM qwen3:4b-instruct
+PARAMETER num_ctx 4096

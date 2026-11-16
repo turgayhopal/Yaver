@@ -9,8 +9,10 @@ hicbir modulun varligini bilmez. Moduller arasi iletisim yine sadece MQTT.
 
 import functools
 import json
+import os
 import re
 import traceback
+import unicodedata
 from pathlib import Path
 
 import yaml
@@ -20,6 +22,24 @@ ROOT = Path(__file__).parent
 
 def load_config():
     return yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+
+
+def load_secrets():
+    """Kimlik bilgileri (API anahtari, MQTT sifresi) config.yaml'da DEGIL,
+    git'e girmeyen secrets.yaml'da durur (ornek: secrets_example.yaml).
+    Dosya yoksa bos sozluk - kimlik bilgisi gerektirmeyen kurulum calisir."""
+    path = ROOT / "secrets.yaml"
+    if not path.exists():
+        return {}
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+
+def secret(name, env_var=None):
+    """Bir kimlik bilgisini once secrets.yaml'dan, yoksa ortam degiskeninden okur."""
+    value = load_secrets().get(name)
+    if not value and env_var:
+        value = os.environ.get(env_var)
+    return value or None
 
 
 def resolve_path(value):
@@ -44,6 +64,11 @@ def mqtt_connect(client, config):
     """Broker'a baglanir. Broker kapaliysa anlasilir bir mesajla cikar -
     ham bir ConnectionRefusedError yigini yerine ne yapilacagini soyler."""
     server, port = config["mqtt"]["server"], config["mqtt"]["port"]
+    # Kimlik dogrulama (bkz. CLAUDE.md "Mosquitto kimlik dogrulama"): kullanici
+    # adi config.yaml'da, sifre secrets.yaml'da. username null = anonim.
+    username = config["mqtt"].get("username")
+    if username:
+        client.username_pw_set(username, secret("mqtt_password", "YAVER_MQTT_PASSWORD"))
     try:
         client.connect(server, port, 60)
     except OSError as error:
@@ -87,6 +112,18 @@ EMOJI_PATTERN = re.compile(
     "]+",
     flags=re.UNICODE,
 )
+
+
+def normalize(text):
+    """Karsilastirma icin sadelestirir: kucuk harf, aksansiz (s/c/g/o/u),
+    noktasiz i, noktalama yok, tek bosluk. Ornek: 'Altyazi M.K.' -> 'altyazi mk'.
+    ear (cop filtresi, tetik/dur kelimesi) ve brain (tekrar filtresi) ortak kullanir."""
+    text = unicodedata.normalize("NFKD", text.lower())
+    # combining: aksan isaretleri (ve lower()'in 'I' (buyuk noktali) icin
+    # biraktigi nokta) ayri karakter olarak duser. Noktasiz i ayristirilamaz, elle.
+    text = "".join(ch for ch in text if not unicodedata.combining(ch)).replace(chr(0x131), "i")
+    text = re.sub(r"[^\w\s]", "", text)
+    return " ".join(text.split())
 
 
 def strip_emoji(text):

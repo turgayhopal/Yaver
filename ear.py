@@ -18,23 +18,24 @@ import re
 import sys
 import threading
 import time
-import unicodedata
 from collections import deque
 from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
 
-from common import guard, load_config, mqtt_client, mqtt_connect, parse_payload
+from common import guard, load_config, mqtt_client, mqtt_connect, normalize, parse_payload
 
 CONFIG = load_config()
 REC = CONFIG["recording"]
+BARGE = CONFIG.get("barge_in") or {}
 SILENT_MODE = "--textonly" in sys.argv
 
 audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
 
 mouth_busy = threading.Event()   # agiz konusurken kulak susar
 ack_done = threading.Event()     # "efendim" bitti, kayda baslayabiliriz
+followup_until = [0.0]           # bu ana kadar "yaver" demeden devam edilebilir (bkz. wakeword.followup_sec)
 
 
 # --------------------------------------------------------------------------- MQTT
@@ -55,6 +56,9 @@ def start_mqtt():
             mouth_busy.clear()
             if status == "ready":
                 ack_done.set()
+            else:
+                # Yaver sustu: kisa bir sure tetik kelimesiz takip cumlesi kabul et
+                followup_until[0] = time.time() + CONFIG["wakeword"].get("followup_sec", 0)
 
     def on_connect(client_, userdata, flags, rc, properties=None):
         client_.subscribe(CONFIG["mqtt"]["topic_status"])
@@ -74,6 +78,14 @@ def publish_status(client, status):
         CONFIG["mqtt"]["topic_status"],
         json.dumps({"module": "ear", "status": status}, ensure_ascii=False),
     )
+
+
+def publish_stop(client):
+    """Soz kesme: mouth sussun, brain cevabi yarida biraksin."""
+    if client is None:
+        print("  [yayinlanmadi] dur komutu")
+        return
+    client.publish(CONFIG["mqtt"]["topic_control"], json.dumps({"command": "stop", "source": "ear"}))
 
 
 def publish_text(client, text):
@@ -223,10 +235,11 @@ def load_wakeword():
 
 
 # --------------------------------------------------------------------------- akis
-def record_speech(threshold, pre_roll=None):
+def record_speech(threshold, pre_roll=None, abort_on_mouth=True):
     """Sessizlik gelene kadar kaydeder, int16 numpy dizisi dondurur.
 
     pre_roll: tetiklenmeden onceki bloklar. Cumlenin ilk hecesi bunlarda.
+    abort_on_mouth=False: soz kesme kaydi - agiz konusurken de kaydet.
     """
     print("  dinliyorum...", end="", flush=True)
     chunks = list(pre_roll) if pre_roll else []
@@ -242,7 +255,7 @@ def record_speech(threshold, pre_roll=None):
         # Kayit sirasinda agiz konusmaya basladiysa (orn. onceki sorunun
         # cevabi geldi) kaydi at: yoksa Yaver'in kendi sesi kayda girer,
         # cevabinda "Yaver" geciyorsa kendi kendini tetikleyebilirdi.
-        if mouth_busy.is_set():
+        if abort_on_mouth and mouth_busy.is_set():
             print(" iptal (agiz konusmaya basladi).")
             return np.array([], dtype=np.int16)
         chunks.append(block)
@@ -258,19 +271,6 @@ def record_speech(threshold, pre_roll=None):
 
     print(f" bitti.{f' ({resets} kez gurultu sessizligi kesti)' if resets else ''}")
     return np.concatenate(chunks) if chunks else np.array([], dtype=np.int16)
-
-
-def normalize(text):
-    """Karsilastirma icin sadelestirir: kucuk harf, aksansiz (s/c/g/o/u),
-    noktasiz i, noktalama yok, tek bosluk. Ornek: 'Altyazi M.K.' -> 'altyazi mk'.
-    Onceki elle harf degistirme u/c sapkalarini kaciriyordu ("Tesekkurler"
-    filtrelenmiyordu)."""
-    text = unicodedata.normalize("NFKD", text.lower())
-    # combining: aksan isaretleri (ve lower()'in 'I' (buyuk noktali) icin
-    # biraktigi nokta) ayri karakter olarak duser. Noktasiz i ayristirilamaz, elle.
-    text = "".join(ch for ch in text if not unicodedata.combining(ch)).replace(chr(0x131), "i")
-    text = re.sub(r"[^\w\s]", "", text)
-    return " ".join(text.split())
 
 
 # Whisper sessizlik/gurultu uzerine bunlari uydurur - liste config.yaml'da.
@@ -289,6 +289,24 @@ def contains_trigger(text):
     """Cumle icinde herhangi bir yerde tetik kelimesi geciyor mu (uyandirma
     modeli kapaliyken kullanilir - bkz. config.yaml wakeword.enabled)."""
     return bool(TRIGGER_PATTERN.search(text))
+
+
+STOP_WORDS = {normalize(w) for w in BARGE.get("stop_words") or []}
+
+
+def is_stop_command(text):
+    """Yaver konusurken duyulan cumle bir "dur" komutu mu? HEM tetik kelime
+    HEM bir dur kelimesi gecmeli - hoparlorden mikrofona sizan Yaver'in kendi
+    sesi tek basina "dur" icerebilir, kendi kendini susturmasin."""
+    words = normalize(text).split()
+    return contains_trigger(text) and any(w in STOP_WORDS for w in words)
+
+
+def accept_utterance(text, has_wakeword, now, followup_deadline):
+    """Taninan cumle brain'e gonderilsin mi? Uyandirma kelimesiyle
+    baslatildiysa ya da cumlede tetik kelime geciyorsa evet; Yaver az once
+    konustuysa (takip penceresi) tetik kelime de gerekmez."""
+    return has_wakeword or contains_trigger(text) or now < followup_deadline
 
 
 def transcribe(whisper, audio):
@@ -348,11 +366,25 @@ def main():
         while True:
             block = audio_queue.get()
 
-            # Agiz konusurken hicbir seyi tetikleme, kendi sesini duymasin.
+            # Agiz konusurken normal tetikleme yok (kendi sesini duymasin).
+            # Soz kesme acikken sadece yuksek sesli konusma kaydedilip
+            # "Yaver dur" olup olmadigina bakilir.
             if mouth_busy.is_set():
-                pre_buffer.clear()
                 if oww:
                     oww.reset()
+                pre_buffer.append(block)
+                if (not oww and BARGE.get("enabled")
+                        and rms(block) > threshold * BARGE["threshold_multiplier"]):
+                    print("\n>> konusurken ses algilandi (soz kesme?)")
+                    audio = record_speech(threshold * BARGE["threshold_multiplier"], pre_buffer,
+                                          abort_on_mouth=False)
+                    pre_buffer.clear()
+                    text = transcribe(whisper, audio)
+                    if text and is_stop_command(text):
+                        print(f'  DUR: "{text}"')
+                        publish_stop(client)
+                    elif text:
+                        print(f'  (soz kesme degil: "{text}")')
                 continue
 
             pre_buffer.append(block)
@@ -377,6 +409,7 @@ def main():
                 if rms(block) < threshold:
                     continue
                 print("\n>> ses algilandi")
+            heard_at = time.time()  # takip penceresi konusmanin BASLADIGI ana gore
 
             publish_status(client, "listening")
             audio = record_speech(threshold, pre_buffer)
@@ -386,8 +419,9 @@ def main():
 
             if not text:
                 print("  (bos, atlandi)")
-            elif oww or contains_trigger(text):
+            elif accept_utterance(text, bool(oww), heard_at, followup_until[0]):
                 print(f'  ANLADIM: "{text}"')
+                followup_until[0] = 0.0  # pencere tek cumlelik; Yaver cevap verince yeniden acilir
                 publish_text(client, text)
             else:
                 print(f'  (tetik kelime yok, atlandi: "{text}")')

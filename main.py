@@ -59,7 +59,8 @@ def check_llm():
     import httpx
 
     llm = CONFIG["llm"]
-    if llm["provider"] != "local":
+    if llm["provider"] == "claude":
+        check_claude(llm["claude"])
         return
     local = llm["local"]
     try:
@@ -75,6 +76,30 @@ def check_llm():
         print(f"[main]        Ollama icin: ollama pull {local['model']}")
         return
     print(f"[main] LLM hazir: {local['model']} @ {local['server']}")
+
+
+def check_claude(claude):
+    """Claude secildiyse: paket kurulu mu, anahtar var mi, model erisilebilir mi."""
+    from common import secret
+
+    print("[main] LLM: Claude API (internet gerekir, ucretli) - llm.provider: claude")
+    try:
+        import anthropic
+    except ImportError:
+        print("[main] UYARI: 'anthropic' paketi kurulu degil: pip install -r requirements.txt")
+        return
+    key = secret("anthropic_api_key", "ANTHROPIC_API_KEY")
+    if not key:
+        print("[main] UYARI: Claude API anahtari yok. secrets_example.yaml'i secrets.yaml olarak")
+        print("[main]        kopyalayip anthropic_api_key'i doldur (ya da ANTHROPIC_API_KEY).")
+        return
+    try:
+        anthropic.Anthropic(api_key=key, timeout=LAUNCHER["check_timeout_sec"] * 3, max_retries=0
+                            ).models.retrieve(claude["model"])
+    except Exception as error:
+        print(f"[main] UYARI: Claude'a ulasilamiyor: {error}")
+        return
+    print(f"[main] LLM hazir: {claude['model']} (Claude API)")
 
 
 def relay_output(name, proc):

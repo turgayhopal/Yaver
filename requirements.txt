@@ -3,6 +3,7 @@
 paho-mqtt
 pyyaml
 httpx
+anthropic          # sadece llm.provider: claude secilince kullanilir
 numpy
 sounddevice
 faster-whisper

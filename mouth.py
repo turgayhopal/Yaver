@@ -3,6 +3,10 @@
 MQTT'den cevap metni alir, Piper ile seslendirir, hoparlorden calar.
 Cumleler sirayla calinir, ust uste binmez.
 
+Iki thread: biri sentezler, digeri calar. Bir cumle calarken siradaki
+zaten sentezleniyor - cumleler arasinda sentez suresi kadar sessizlik
+kalmiyor. yaver/control "stop" gelince calma aninda kesilir.
+
 Kullanim:
     python mouth.py
     python mouth.py --say "merhaba ben yaver"   -> MQTT'siz tek cumle soyle
@@ -14,6 +18,7 @@ import queue
 import random
 import sys
 import threading
+import time
 import wave
 
 import numpy as np
@@ -25,7 +30,11 @@ from common import (guard, load_config, mqtt_client, mqtt_connect, parse_payload
 CONFIG = load_config()
 MOUTH = CONFIG["mouth"]
 
-speech_queue: "queue.Queue[dict]" = queue.Queue()
+speech_queue: "queue.Queue[dict]" = queue.Queue()   # metin isleri -> sentez thread'i
+audio_queue: "queue.Queue[dict]" = queue.Queue()    # hazir ses -> calma thread'i
+stop_flag = threading.Event()   # soz kesildi: calani kes, kuyruklari bosalt
+generation = [0]                # her soz kesmede artar; eski kusaga ait isler (yolda olan sentez) atilir
+muted_until = [0.0]             # soz kesildikten sonra yarim cevabin gec gelen cumlelerini yut
 ack_audio = []       # [(int16 dizi, ornekleme)] - acilista hazirlanir
 client_ref = [None]  # calisan is parcacigi buradan yayin yapar
 
@@ -110,38 +119,82 @@ def publish_status(status):
     )
 
 
-def worker(voice):
+def drain(q):
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
+
+
+def synth_worker(voice):
+    """Metni sese cevirip calma kuyruguna koyar - calma ile paralel."""
     while True:
         job = speech_queue.get()
+        if job["gen"] != generation[0]:
+            continue
+        try:
+            if job["type"] == "ack":
+                audio = random.choice(ack_audio) if ack_audio else None
+            else:
+                text = strip_emoji(job["content"])
+                audio = synthesize(voice, text) if text else None
+        except Exception as error:
+            print(f"  seslendirme hatasi: {error}")
+            audio = None
+        audio_queue.put({**job, "audio": audio})
+
+
+def play_worker():
+    while True:
+        job = audio_queue.get()
+        if job["gen"] != generation[0]:
+            continue
         publish_status("speaking")
         while True:
             try:
-                if job["type"] == "ack":
-                    if ack_audio:
-                        play(*random.choice(ack_audio))
-                    publish_status("ready")   # kulak bu sinyali bekliyor
-                else:
+                if job["type"] == "text":
                     print(f'  soyluyorum: "{job["content"]}"')
-                    speak(voice, job["content"])
+                if job["audio"] is not None:
+                    play(*job["audio"])
             except Exception as error:
-                print(f"  seslendirme hatasi: {error}")
-                if job["type"] == "ack":
-                    publish_status("ready")
+                print(f"  calma hatasi: {error}")
+            if job["type"] == "ack":
+                publish_status("ready")   # kulak bu sinyali bekliyor
+            if stop_flag.is_set():
+                break
             # brain cumle cumle yayinliyor, kuyruk anlik bos olsa bile bir
             # sonraki cumle hemen ardindan gelebilir - "done" demeden once
             # kisa bir sure bekle, yoksa ear erken "mouth sustu" sanip
             # mouth'un kendi sesini dinlemeye baslar (geri besleme dongusu).
             try:
-                job = speech_queue.get(timeout=MOUTH["reply_gap_sec"])
+                job = audio_queue.get(timeout=MOUTH["reply_gap_sec"])
             except queue.Empty:
                 break
+            if stop_flag.is_set() or job["gen"] != generation[0]:
+                break
         publish_status("done")
+
+
+def stop_speaking():
+    """Soz kesme (MQTT thread'inden): calani durdur, bekleyenleri at."""
+    stop_flag.set()
+    generation[0] += 1
+    muted_until[0] = time.time() + (CONFIG.get("barge_in") or {}).get("mute_sec", 3.0)
+    drain(speech_queue)
+    drain(audio_queue)
+    sd.stop()
+    print("  [kontrol] sustum")
+    # play_worker bu bayragi gorup "done" yayinlar; kisa bir sure sonra
+    # bayrak kalkar ki yeni cevaplar calinabilsin.
+    threading.Timer(0.3, stop_flag.clear).start()
 
 
 def main():
     voice = load_voice()
     prepare_acks(voice)
-    threading.Thread(target=worker, args=(voice,), daemon=True).start()
+    threading.Thread(target=synth_worker, args=(voice,), daemon=True).start()
+    threading.Thread(target=play_worker, daemon=True).start()
 
     client = mqtt_client("yaver-mouth")
     client_ref[0] = client
@@ -158,17 +211,29 @@ def main():
         packet = parse_payload(msg)
         if packet is None:
             return
+        if msg.topic == CONFIG["mqtt"]["topic_control"]:
+            if packet.get("command") == "stop":
+                stop_speaking()
+            return
         if msg.topic == CONFIG["mqtt"]["topic_status"]:
             if packet.get("module") == "ear" and packet.get("status") == "woke":
-                speech_queue.put({"type": "ack"})
+                speech_queue.put({"type": "ack", "gen": generation[0]})
+            elif packet.get("module") == "brain" and packet.get("status") in ("done", "thinking"):
+                # Kesilen turun cumleleri brain'in "done"undan ONCE gelir; yeni bir
+                # soru ("thinking") ya da turun bitisi yutmayi sonlandirir.
+                muted_until[0] = 0.0
             return
         text = text_field(packet)
         if text:
-            speech_queue.put({"type": "text", "content": text})
+            if time.time() < muted_until[0]:
+                print(f'  (soz kesildi, atlandi: "{text}")')
+                return
+            speech_queue.put({"type": "text", "content": text, "gen": generation[0]})
 
     def on_connect(client_, userdata, flags, rc, properties=None):
         client_.subscribe(CONFIG["mqtt"]["topic_reply"])
         client_.subscribe(CONFIG["mqtt"]["topic_status"])
+        client_.subscribe(CONFIG["mqtt"]["topic_control"])
         print(f"Dinleniyor: {CONFIG['mqtt']['topic_reply']} + {CONFIG['mqtt']['topic_status']}")
 
     client.on_connect = on_connect

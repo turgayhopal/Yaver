@@ -147,6 +147,268 @@ class SkillsTest(unittest.TestCase):
         self.assertEqual(set(schema["enum"]), set(skills.devices_by_type("led")))
 
 
+class ClaudeConversionTest(unittest.TestCase):
+    def test_tool_turn_becomes_tool_use_and_merged_results(self):
+        messages = [
+            {"role": "user", "content": "ikisini de kapat"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "led_control", "arguments": '{"state": "off"}'}},
+                {"id": "b", "type": "function", "function": {"name": "led_control", "arguments": "bozuk"}}]},
+            {"role": "tool", "tool_call_id": "a", "content": "{}"},
+            {"role": "tool", "tool_call_id": "b", "content": "{}"},
+            {"role": "assistant", "content": ""},
+        ]
+        out = brain.to_claude_messages(messages)
+        self.assertEqual([m["role"] for m in out], ["user", "assistant", "user"])  # bos cevap atildi
+        self.assertEqual([b["type"] for b in out[1]["content"]], ["tool_use", "tool_use"])
+        self.assertEqual(out[1]["content"][0]["input"], {"state": "off"})
+        self.assertEqual(out[1]["content"][1]["input"], {})  # bozuk JSON cokertmez
+        self.assertEqual([b["tool_use_id"] for b in out[2]["content"]], ["a", "b"])  # tek mesajda
+
+    def test_raw_claude_content_is_sent_back_unchanged(self):
+        raw = [{"type": "thinking", "thinking": "", "signature": "s"},
+               {"type": "tool_use", "id": "a", "name": "x", "input": {}}]
+        out = brain.to_claude_messages([{"role": "assistant", "content": None, "tool_calls": [], "claude_content": raw}])
+        self.assertIs(out[0]["content"], raw)
+
+    def test_openai_messages_drop_claude_fields(self):
+        out = brain.openai_messages("S", [{"role": "assistant", "content": "x", "claude_content": [1]}])
+        self.assertEqual(out, [{"role": "system", "content": "S"}, {"role": "assistant", "content": "x"}])
+
+    def test_tool_schema(self):
+        tools = brain.to_claude_tools([{"type": "function", "function": {"name": "t", "description": "d",
+                                                                        "parameters": {"type": "object"}}}])
+        self.assertEqual(tools, [{"name": "t", "description": "d", "input_schema": {"type": "object"}}])
+
+
+class ConfirmationTest(unittest.TestCase):
+    def test_answers(self):
+        self.assertEqual(brain.confirmation_answer("Evet, onaylıyorum."), "yes")
+        self.assertEqual(brain.confirmation_answer("Hayır, vazgeç."), "no")
+        self.assertEqual(brain.confirmation_answer("evet hayır yapma"), "no")  # karisik = iptal
+        self.assertIsNone(brain.confirmation_answer("Hava nasıl?"))
+
+    def test_tool_list_confirm_flag_is_stripped(self):
+        tools = [{"type": "function", "function": {"name": "a"}, "confirm": True},
+                 {"type": "function", "function": {"name": "b"}}]
+        try:
+            brain.apply_tool_list(tools)
+            self.assertEqual(brain.confirm_tools, {"a"})
+            self.assertTrue(all("confirm" not in t for t in brain.available_tools))
+        finally:
+            brain.apply_tool_list([])
+
+
+class RepeatFilterTest(unittest.TestCase):
+    def setUp(self):
+        brain.history.clear()
+
+    def tearDown(self):
+        brain.history.clear()
+
+    def test_trailing_filler_is_dropped_but_first_sentence_kept(self):
+        brain.add_turn([{"role": "user", "content": "x"},
+                        {"role": "assistant", "content": "Bilmiyorum. Lütfen daha net bir şekilde sor."}])
+        seen = brain.recent_sentences(3)
+        self.assertTrue(brain.is_repeat("Lütfen daha net bir şekilde sor.", seen, 1))
+        self.assertFalse(brain.is_repeat("Bilmiyorum.", seen, 0))   # ilk cumle hep soylenir
+        self.assertFalse(brain.is_repeat("Yeni bir cümle.", seen, 1))
+
+
+class AskLoopTest(unittest.TestCase):
+    """ask()'in arac dongusu - LLM ve skills sahte."""
+
+    def setUp(self):
+        quiet = contextlib.redirect_stdout(io.StringIO())  # arac loglari test ciktisini kirletmesin
+        quiet.__enter__()
+        self.addCleanup(quiet.__exit__, None, None, None)
+        brain.history.clear()
+        brain.pending_action.clear()
+        brain.apply_tool_list([{"type": "function", "function": {"name": "led_control"}},
+                               {"type": "function", "function": {"name": "delegate_task"}, "confirm": True}])
+        self.saved = (brain.llm_turn, brain.call_skill, brain.write_history, brain.client_ref[0])
+        brain.client_ref[0] = object()
+        brain.write_history = lambda: None
+        self.skill_calls = []
+        brain.call_skill = lambda name, params, on_slow=None: (self.skill_calls.append((name, params))
+                                                               or {"status": "ok", "data": {}})
+
+    def tearDown(self):
+        brain.llm_turn, brain.call_skill, brain.write_history, brain.client_ref[0] = self.saved
+        brain.apply_tool_list([])
+        brain.history.clear()
+        brain.pending_action.clear()
+
+    @staticmethod
+    def call(name, args):
+        return {"id": f"id_{name}_{args}", "type": "function", "function": {"name": name, "arguments": args}}
+
+    def script(self, *replies):
+        replies = list(replies)
+        self.rounds = []
+
+        def fake(system, messages, tools, on_sentence, final_round=False):
+            self.rounds.append(final_round)
+            text, calls = replies.pop(0)
+            if text and not calls:
+                on_sentence(text)
+            return text, calls, {}
+        brain.llm_turn = fake
+
+    def test_two_tools_in_one_round_then_answer(self):
+        self.script(("", [self.call("led_control", '{"state": "off", "device": "a"}'),
+                          self.call("led_control", '{"state": "off", "device": "b"}')]),
+                    ("İkisini de kapattım.", []))
+        self.assertEqual(brain.ask("ikisini de kapat"), "İkisini de kapattım.")
+        self.assertEqual(len(self.skill_calls), 2)
+        self.assertEqual(len(brain.history[-1]), 5)  # soru, karar, 2 sonuc, cevap
+
+    def test_repeated_identical_call_is_not_run_twice(self):
+        same = self.call("led_control", '{"state": "on"}')
+        self.script(("", [same]), ("", [same]), ("Yaktım.", []))
+        brain.ask("ledi yak")
+        self.assertEqual(len(self.skill_calls), 1)
+        self.assertEqual(self.rounds[-1], True)  # tekrar gorulunce son (aracsiz) adima gecildi
+
+    def test_confirm_tool_waits_for_spoken_yes(self):
+        self.script(("", [self.call("delegate_task", '{"task": "derle"}')]), ("Onaylıyor musun?", []))
+        brain.ask("projeyi derle")
+        self.assertEqual(self.skill_calls, [])            # onaysiz calismadi
+        self.assertEqual(brain.pending_action["name"], "delegate_task")
+        self.script(("Başlattım.", []))
+        brain.ask("evet")
+        self.assertEqual(self.skill_calls, [("delegate_task", {"task": "derle"})])
+        self.assertFalse(brain.pending_action)
+
+    def test_confirm_tool_cancelled_by_no(self):
+        self.script(("", [self.call("delegate_task", '{"task": "derle"}')]), ("Onaylıyor musun?", []))
+        brain.ask("projeyi derle")
+        self.script(("Tamam, iptal ettim.", []))
+        brain.ask("hayır vazgeç")
+        self.assertEqual(self.skill_calls, [])
+
+
+class ClaudeStreamTest(unittest.TestCase):
+    """claude_turn() + ask(): sahte HTTP sunucusu (internet/anahtar gerekmez)."""
+
+    @staticmethod
+    def sse(events):
+        import json as _json
+        return "".join(f"event: {e['type']}\ndata: {_json.dumps(e)}\n\n" for e in events).encode()
+
+    def test_tool_round_echoes_thinking_and_keeps_history_clean(self):
+        try:
+            import anthropic
+            import httpx2
+        except ImportError:
+            self.skipTest("anthropic paketi yok")
+        import json as _json
+        start = {"type": "message_start", "message": {
+            "id": "m", "type": "message", "role": "assistant", "model": "x", "content": [],
+            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 0}}}
+        end = lambda reason: [{"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": None},
+                               "usage": {"output_tokens": 1}}, {"type": "message_stop"}]
+        streams = [
+            [start, {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
+             {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "SIG"}},
+             {"type": "content_block_stop", "index": 0},
+             {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "t1", "name": "get_datetime", "input": {}}},
+             {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{}"}},
+             {"type": "content_block_stop", "index": 1}] + end("tool_use"),
+            [start, {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+             {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Saat on dört beş."}},
+             {"type": "content_block_stop", "index": 0}] + end("end_turn"),
+        ]
+        requests = []
+
+        def handler(request):
+            requests.append(_json.loads(request.content))
+            return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=self.sse(streams.pop(0)))
+
+        saved = (brain.PROVIDER, brain.claude_ref[0], brain.client_ref[0], brain.call_skill, brain.write_history)
+        brain.PROVIDER = "claude"
+        brain.claude_ref[0] = anthropic.Anthropic(api_key="test", http_client=httpx2.Client(transport=httpx2.MockTransport(handler)))
+        brain.client_ref[0] = object()
+        brain.call_skill = lambda n, p, on_slow=None: {"status": "ok", "data": {"saat": "14:05"}}
+        brain.write_history = lambda: None
+        brain.history.clear()
+        brain.apply_tool_list([{"type": "function", "function": {"name": "get_datetime", "parameters": {"type": "object"}}}])
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                reply = brain.ask("saat kaç")
+        finally:
+            (brain.PROVIDER, brain.claude_ref[0], brain.client_ref[0], brain.call_skill, brain.write_history) = saved
+            brain.apply_tool_list([])
+            turn = brain.history.pop()
+        self.assertEqual(reply, "Saat on dört beş.")
+        self.assertNotIn("temperature", requests[0])
+        self.assertEqual(requests[1]["messages"][1]["content"][0], {"type": "thinking", "thinking": "", "signature": "SIG"})
+        self.assertEqual(requests[1]["messages"][2]["content"][0]["type"], "tool_result")
+        self.assertFalse(any("claude_content" in m for m in turn))  # thinking gecmise yazilmaz
+
+
+class SkillHelpersTest(unittest.TestCase):
+    def test_number_to_turkish(self):
+        cases = {0: "sıfır", 7: "yedi", 14: "on dört", 100: "yüz", 101: "yüz bir", 1000: "bin",
+                 2026: "iki bin yirmi altı", 1999: "bin dokuz yüz doksan dokuz", -5: "eksi beş"}
+        for n, words in cases.items():
+            self.assertEqual(skills.number_to_turkish(n), words)
+
+    def test_describe_now(self):
+        import time as _time
+        now = _time.mktime((2026, 11, 16, 14, 5, 0, 0, 0, -1))
+        info = skills.describe_now(now)
+        self.assertEqual(info["gun"], "Pazartesi")
+        self.assertEqual(info["tarih"], "16 Kasım 2026")
+        self.assertEqual(info["saat"], "14:05")
+        self.assertEqual(info["saat_yazi"], "on dört beş")
+
+    def test_safe_eval(self):
+        self.assertEqual(skills.safe_eval("17*23"), 391)
+        self.assertEqual(skills.safe_eval("(120-35)/5"), 17)
+        self.assertEqual(skills.safe_eval("2,5*2"), 5)
+        for bad in ["__import__('os')", "a+1", "2**100000", "[1]"]:
+            with self.assertRaises(Exception):
+                skills.safe_eval(bad)
+
+    def test_publish_and_wait_gets_ack(self):
+        class FakeClient:
+            def publish(self, topic, payload, retain=False):
+                ctx.deliver("ack", payload)   # cihaz aninda cevap veriyor
+        ctx = skills.SkillContext(FakeClient())
+        self.assertEqual(ctx.publish_and_wait("cmd", "on", "ack", 1.0), "on")
+
+    def test_led_without_ack_is_error(self):
+        ctx = skills.SkillContext(None)  # kimse cevap vermez
+        device = next(iter(skills.devices_by_type("led")))
+        saved = skills.SK["device_ack_timeout_sec"]
+        skills.CONFIG["devices"][device]["ack_timeout_sec"] = 0.05
+        try:
+            result = skills.run_skill(ctx, "led_control", {"device": device, "state": "on"})
+        finally:
+            skills.CONFIG["devices"][device].pop("ack_timeout_sec")
+            skills.SK["device_ack_timeout_sec"] = saved
+        self.assertEqual(result["status"], "error")
+
+    def test_confirm_flag_in_tool_list(self):
+        defs = {t["function"]["name"]: t for t in skills.tool_definitions()}
+        self.assertNotIn("confirm", defs["get_datetime"])
+
+
+class EarTextTest(unittest.TestCase):
+    def test_stop_command_needs_trigger_and_stop_word(self):
+        self.assertTrue(ear.is_stop_command("Yaver dur."))
+        self.assertTrue(ear.is_stop_command("Yaver, sus artık"))
+        self.assertFalse(ear.is_stop_command("Dur bakalım, düşüneyim."))     # tetik yok
+        self.assertFalse(ear.is_stop_command("Yaver bugün hava nasıl?"))     # dur kelimesi yok
+        self.assertFalse(ear.is_stop_command("Yaver durumu nasıl?"))         # 'durumu' != 'dur'
+
+    def test_followup_window(self):
+        self.assertTrue(ear.accept_utterance("evet", False, now=10, followup_deadline=12))
+        self.assertFalse(ear.accept_utterance("evet", False, now=13, followup_deadline=12))
+        self.assertTrue(ear.accept_utterance("Yaver saat kaç", False, now=13, followup_deadline=12))
+
+
 class SharedHelpersTest(unittest.TestCase):
     def test_modules_do_not_shadow_common_helpers(self):
         # ear.py'nin kendi mqtt_connect()'i common'dakini ezmisti, ear acilista
