@@ -23,6 +23,7 @@ import operator
 import subprocess
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from common import guard, load_config, mqtt_client, mqtt_connect, parse_payload, resolve_path
@@ -77,35 +78,41 @@ class SkillContext:
 
     def __init__(self, client):
         self.client = client
-        self._waiters = {}   # topic -> [(Event, holder)]
+        self._waiters = {}   # topic -> [(Event, holder, match)]
         self._lock = threading.Lock()
+        self.last = {}       # topic -> son gelen yuk (orn. retained online durumu)
 
-    def publish(self, topic, payload, retain=False):
+    def publish(self, topic, payload, retain=False, qos=0):
         if self.client is not None:
-            self.client.publish(topic, payload, retain=retain)
+            self.client.publish(topic, payload, qos=qos, retain=retain)
 
-    def publish_and_wait(self, topic, payload, ack_topic, timeout):
+    def publish_and_wait(self, topic, payload, ack_topic, timeout, match=None, qos=0):
         """Mesaji yayinlar, cihazin ack_topic'e cevap vermesini bekler.
         Cevap (str) ya da zaman asiminda None dondurur. Bekleyici YAYINDAN
-        ONCE kaydedilir - hizli bir cihazin cevabi kacmasin."""
-        event, holder = threading.Event(), {}
+        ONCE kaydedilir - hizli bir cihazin cevabi kacmasin.
+        match: verilirse sadece match(yuk) True olan cevap kabul edilir
+        (orn. istek id'si tutan sonuc - baska bir istegin cevabi karismasin)."""
+        waiter = (threading.Event(), {}, match)
         with self._lock:
-            self._waiters.setdefault(ack_topic, []).append((event, holder))
+            self._waiters.setdefault(ack_topic, []).append(waiter)
         try:
-            self.publish(topic, payload)
-            event.wait(timeout)
+            self.publish(topic, payload, qos=qos)
+            waiter[0].wait(timeout)
         finally:
             with self._lock:
                 waiters = self._waiters.get(ack_topic, [])
-                if (event, holder) in waiters:
-                    waiters.remove((event, holder))
-        return holder.get("payload")
+                if waiter in waiters:
+                    waiters.remove(waiter)
+        return waiter[1].get("payload")
 
     def deliver(self, topic, payload):
         """MQTT ag thread'inden: bir ack konusuna gelen mesaji bekleyenlere ilet."""
         with self._lock:
+            self.last[topic] = payload
             waiters = list(self._waiters.get(topic, []))
-        for event, holder in waiters:
+        for event, holder, match in waiters:
+            if event.is_set() or (match is not None and not match(payload)):
+                continue
             holder["payload"] = payload
             event.set()
 
@@ -452,6 +459,71 @@ if DELEGATE.get("enabled"):
         return {"status": "başladı", "task": task}
 
 
+# config.yaml -> devices, type: board - kendi servisini calistiran kart
+# (orn. Yaver Saat). LLM cihazi ve config'de ADLANDIRILMIS komutu secer;
+# kart sonucu istek id'siyle geri yazar (bkz. CLAUDE.md "Cihaz konulari").
+BOARDS = devices_by_type("board")
+
+
+def parse_device_result(payload, request_id):
+    """Kartin result konusuna yazdigi JSON'dan bu istegin sonucunu cikarir.
+    Bozuk yuk ya da baska bir istegin cevabi -> None (saf, test edilir)."""
+    try:
+        packet = json.loads(payload)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(packet, dict) or packet.get("id") != request_id:
+        return None
+    return packet
+
+
+if BOARDS:
+    BOARD_COMMANDS = sorted({name for cfg in BOARDS.values() for name in (cfg.get("commands") or {})})
+
+    @skill(
+        name="device_command",
+        description="Ağdaki bir karta (örn. Yaver Saat) önceden tanımlı bir komut gönderir ve "
+                    "kartın onayını bekler. Komutlar: " + "; ".join(
+                        f"{dev}.{name} = {cmd['label']}"
+                        for dev, cfg in BOARDS.items()
+                        for name, cmd in (cfg.get("commands") or {}).items()),
+        parameters={
+            "type": "object",
+            "properties": {
+                "device": device_param_schema("board"),
+                "command": {"type": "string", "enum": BOARD_COMMANDS,
+                            "description": "Gönderilecek komutun adı"},
+            },
+            "required": ["device", "command"],
+        },
+        confirm=any(cmd.get("confirm") for cfg in BOARDS.values()
+                    for cmd in (cfg.get("commands") or {}).values()),
+    )
+    def device_command(ctx, device, command):
+        cfg = BOARDS.get(device)
+        if cfg is None:
+            raise ValueError(f"bilinmeyen cihaz: {device}")
+        cmd = (cfg.get("commands") or {}).get(command)
+        if cmd is None:
+            raise ValueError(f"{device} bu komutu bilmiyor: {command}")
+        online_topic = cfg.get("online_topic")
+        if online_topic and ctx.last.get(online_topic) == "0":
+            raise RuntimeError("cihaz şu an kapalı ya da ağa bağlı değil, komut GÖNDERİLMEDİ")
+        request_id = uuid.uuid4().hex[:12]
+        payload = json.dumps({"id": request_id, "command": command,
+                              "params": cmd.get("params") or {}}, ensure_ascii=False)
+        reply = ctx.publish_and_wait(
+            cfg["topic"], payload, cfg["ack_topic"],
+            cmd.get("timeout_sec", cfg.get("ack_timeout_sec", SK["device_ack_timeout_sec"])),
+            match=lambda raw: parse_device_result(raw, request_id) is not None, qos=1)
+        if reply is None:
+            raise RuntimeError("cihaz cevap vermedi (kapalı ya da ağa bağlı değil olabilir), işlem YAPILAMADI")
+        result = parse_device_result(reply, request_id)
+        if result.get("status") != "ok":
+            raise RuntimeError(f"cihaz hata bildirdi: {result.get('message') or result.get('data')}")
+        return {"device": device, "command": command, "data": result.get("data")}
+
+
 # --------------------------------------------------------------------------- MQTT
 def tool_definitions():
     """brain.py'nin LLM'e tanitacagi OpenAI uyumlu arac sema listesi.
@@ -493,7 +565,11 @@ def run_skill(ctx, name, params):
 
 
 def ack_topics():
-    return {cfg["ack_topic"] for cfg in (CONFIG.get("devices") or {}).values() if cfg.get("ack_topic")}
+    """Skills'in dinledigi cihaz konulari: onay (ack) ve cevrimici durumu."""
+    topics = set()
+    for cfg in (CONFIG.get("devices") or {}).values():
+        topics.update(t for t in (cfg.get("ack_topic"), cfg.get("online_topic")) if t)
+    return topics
 
 
 def main():
@@ -537,7 +613,7 @@ def main():
     def on_connect(client_, userdata, flags, rc, properties=None):
         client_.subscribe(SK["topic_request"])
         for topic in acks:
-            client_.subscribe(topic)
+            client_.subscribe(topic, qos=1)
         publish_tool_list(client_)
         publish_memory(ctx)
         print(f"Dinleniyor: {SK['topic_request']}")

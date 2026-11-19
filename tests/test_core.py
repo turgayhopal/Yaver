@@ -147,6 +147,67 @@ class SkillsTest(unittest.TestCase):
         self.assertEqual(set(schema["enum"]), set(skills.devices_by_type("led")))
 
 
+class DeviceCommandTest(unittest.TestCase):
+    """type: board kartlari (Yaver Saat) - id eslesmeli cihaz sonucu."""
+
+    class FakeBoardClient:
+        """publish edilen komuta, once BASKA bir istegin sonucunu sonra
+        dogru id'li sonucu veren sahte kart."""
+
+        def __init__(self, status="ok"):
+            self.ctx = None
+            self.status = status
+            self.sent = []
+
+        def publish(self, topic, payload, retain=False, qos=0):
+            import json as _json
+            self.sent.append((topic, payload))
+            request = _json.loads(payload)
+            ack = skills.BOARDS["saat"]["ack_topic"]
+            self.ctx.deliver(ack, _json.dumps({"id": "baska", "status": "error"}))
+            self.ctx.deliver(ack, _json.dumps({"id": request["id"], "command": request["command"],
+                                               "status": self.status, "data": {"sec": 120},
+                                               "message": "olmadi"}))
+
+    def make_ctx(self, status="ok"):
+        client = self.FakeBoardClient(status)
+        ctx = skills.SkillContext(client)
+        client.ctx = ctx
+        return ctx, client
+
+    def test_parse_device_result(self):
+        self.assertIsNone(skills.parse_device_result("bozuk", "a"))
+        self.assertIsNone(skills.parse_device_result('{"id": "b"}', "a"))
+        self.assertIsNone(skills.parse_device_result("[1]", "a"))
+        self.assertEqual(skills.parse_device_result('{"id": "a", "status": "ok"}', "a")["status"], "ok")
+
+    def test_command_matches_own_id(self):
+        ctx, client = self.make_ctx()
+        result = skills.run_skill(ctx, "device_command", {"device": "saat", "command": "bluetooth_pairing"})
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(result["data"]["data"], {"sec": 120})
+        self.assertEqual(client.sent[0][0], skills.BOARDS["saat"]["topic"])
+
+    def test_device_error_is_reported(self):
+        ctx, _ = self.make_ctx(status="error")
+        result = skills.run_skill(ctx, "device_command", {"device": "saat", "command": "bluetooth_pairing"})
+        self.assertEqual(result["status"], "error")
+        self.assertIn("olmadi", result["data"])
+
+    def test_offline_device_is_not_sent(self):
+        ctx, client = self.make_ctx()
+        ctx.deliver(skills.BOARDS["saat"]["online_topic"], "0")
+        result = skills.run_skill(ctx, "device_command", {"device": "saat", "command": "bluetooth_pairing"})
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(client.sent, [])
+
+    def test_unknown_command_rejected(self):
+        ctx, client = self.make_ctx()
+        result = skills.run_skill(ctx, "device_command", {"device": "saat", "command": "rm_rf"})
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(client.sent, [])
+
+
 class ClaudeConversionTest(unittest.TestCase):
     def test_tool_turn_becomes_tool_use_and_merged_results(self):
         messages = [
@@ -373,7 +434,7 @@ class SkillHelpersTest(unittest.TestCase):
 
     def test_publish_and_wait_gets_ack(self):
         class FakeClient:
-            def publish(self, topic, payload, retain=False):
+            def publish(self, topic, payload, retain=False, qos=0):
                 ctx.deliver("ack", payload)   # cihaz aninda cevap veriyor
         ctx = skills.SkillContext(FakeClient())
         self.assertEqual(ctx.publish_and_wait("cmd", "on", "ack", 1.0), "on")

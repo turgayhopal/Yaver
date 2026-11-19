@@ -109,6 +109,7 @@ Skill altyapısı:
 
 Mevcut araçlar: `led_control`, `get_datetime`, `calculate`, `set_timer`,
 `cancel_timer`, `remember`, `forget`, `run_command` (komut varsa),
+`device_command` (`type: board` kart varsa - Yaver Saat),
 `delegate_task` (açıksa - `skills.delegate`, `claude -p` çalıştırır).
 
 brain'in bir soruyu işleyişi (`ask()`): LLM ya cevap verir (cümle cümle
@@ -185,6 +186,49 @@ bölümünde tanımlı — bkz. yukarıdaki genel cihaz kayıt defteri açıklam
 |---|---|---|
 | `yaver/device/pico_led_masa` | skills → Pico W (`boards/pico_w`) | düz metin: `"on"` / `"off"` |
 | `yaver/device/pico_led_masa/state` | Pico W → skills (retained) | düz metin: uygulanan durum `"on"` / `"off"` - cihaz onayı (`devices.*.ack_topic`). skill `skills.device_ack_timeout_sec` içinde göremezse hata döner, Yaver "cihaz cevap vermedi" der |
+| `yaver/device/<cihaz>/command` | skills → kart (QoS1, retained değil) | `{"id": "...", "command": "bluetooth_pairing", "params": {...}}` - `type: board` kartlar (Yaver Saat), `device_command` aracı. Komutlar `config.yaml` → `devices.<cihaz>.commands`'ta ADLANDIRILMIŞ |
+| `yaver/device/<cihaz>/result` | kart → skills (QoS1, retained değil) | `{"id": aynı, "command": "...", "status": "ok\|error", "data": {...}}` ya da `"message"` - skills sadece kendi `id`'sini kabul eder (`parse_device_result()`); bilinmeyen komut → `error` |
+| `yaver/device/<cihaz>/online` | kart → herkes (retained, LWT) | `"1"` bağlanınca, LWT `"0"` - `"0"` ise `device_command` komutu hiç göndermez |
+
+### Yaver Saat ses sözleşmesi (Faz 3-4, henüz kodlanmadı)
+
+Yaver Saat (Pi Zero 2 W, ayrı repo: `~/Workspace/Hardware/yaver-saat`,
+`PROJE.md`) PC'ye istemci olarak bağlanır: mikrofonu ve hoparlörü MQTT
+üzerinden. Whisper/Piper/LLM PC'de kalır. Hedef: hangi cihaz duyduysa cevap
+oradan çıkar. Plan (iki oturumda kullanıcıyla onaylandı, 2026-11-19):
+
+- Faz 0: PC zinciri evde gerçek mikrofon/hoparlörle test (bu bitmeden ear/mouth ses yoluna dokunulmaz)
+- Faz 1: Mosquitto LAN + kimlik doğrulama + ACL (aşağıda)
+- Faz 2: saat sadece istemci - yüz (`yaver/status`'u okur) + `device_command` **← yapıldı**
+- Faz 3: saat mikrofonu ek ses kaynağı (cevap hâlâ PC hoparlöründen)
+- Faz 4: cevap hedefe göre saat hoparlöründen + `played` onayı
+- Faz 5: iki kaynak birlikte + hakemlik
+
+| Konu | Yön | Yük |
+|---|---|---|
+| `yaver/audio/<cihaz>/mic` | saat → ear (QoS0) | ikili: 4 bayt uint32 LE sıra no + PCM int16 LE mono 16 kHz, tam 1280 örnek (80 ms, 2560 bayt). Kayıp sıra no → o blok sessizlikle doldurulabilir |
+| `yaver/audio/<cihaz>/speaker` | mouth → saat (QoS0) | ikili: tek satır JSON başlık + `"\n"` + PCM int16 LE mono. Başlık `{"utt": "...", "gen": 0, "seq": 0, "rate": 22050, "last": false}`, parça ~100-200 ms, son parça `last: true` (PCM boş olabilir) |
+| `yaver/audio/<cihaz>/played` | saat → mouth (QoS1) | `{"utt": "...", "gen": 0, "status": "played\|stopped\|dropped"}` - `played` ALSA gerçekten boşalınca. mouth "done"u buna göre yayınlar; ses süresi + pay kadar zaman aşımı (saat düşerse ear sağır kalmasın) |
+
+Kurallar:
+- Stop: saat `yaver/control`'e kendisi abone; stop'ta çalmayı keser, o ana
+  kadarki en büyük `gen`'i durdurulmuş sayar, `gen <=` olan parçaları atar.
+  **mouth `gen`'i açılışta epoch milisaniye ile başlatır** (yeniden
+  başlayınca 0'a dönerse saat yeni cevapların hepsini atardı), her stop'ta +1.
+- Saat `yaver/status`'a yazmaz, sadece okur. `yaver/reply/text` ve mouth
+  durumuna `"target"` alanı eklenecek (saat sadece kendi turunda "konuşuyor").
+- Tek ear süreci, N giriş (Whisper tek kopya, kilitli). Çift tetiklemede
+  karar Whisper'dan ÖNCE: ~300-500 ms içinde iki kaynakta başlayan konuşmada
+  RMS'i yüksek olan. Takip penceresi kaynak bazında; mute (mouth_busy) ilk
+  aşamada global. Saat mikrofonunda söz kesme ilk sürümde kapalı (hoparlör
+  INMP441'e çok yakın, AEC yok).
+- Saat PC'ye modemde DHCP rezervasyonuyla sabitlenmiş IP ile bağlanır (Pico gibi).
+- Saat MQTT kullanıcısı `saat`, ACL: yazma `yaver/audio/saat/mic`,
+  `yaver/audio/saat/played`, `yaver/device/saat/online`,
+  `yaver/device/saat/result`; okuma `yaver/audio/saat/speaker`,
+  `yaver/device/saat/command`, `yaver/status`, `yaver/control`,
+  `yaver/reply/text`. Kimlik doğrulamasız broker'da mikrofon akışı =
+  ağdaki herkes odayı dinler ve sahte sesle komut verir: Faz 1 ZORUNLU.
 
 ## Dosya düzeni
 
@@ -276,6 +320,11 @@ sudo systemctl restart mosquitto
 
 Sonra `config.yaml` → `mqtt.username: yaver`, `secrets.yaml` →
 `mqtt_password: ...`, Pico'da `secrets.py` → `MQTT_USER`/`MQTT_PASSWORD`.
+
+Kartlar için ayrı kullanıcı + ACL (`acl_file /etc/mosquitto/acl`): PC
+modülleri `yaver` tam erişim; `pico` yazma `yaver/device/pico_led_masa/state`,
+okuma `yaver/device/pico_led_masa`; `saat` için bkz. "Yaver Saat ses
+sözleşmesi". `allow_anonymous false` olunca Pico da kullanıcı adı/şifre ister.
 
 ### LLM sunucusu notları (yaşanmış, ölçülmüş)
 

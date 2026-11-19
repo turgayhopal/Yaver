@@ -77,6 +77,20 @@ devices:
     topic: yaver/device/pico_led_masa    # bu cihaz bu konuyu dinler, "on"/"off" payload'u bekler
     ack_topic: yaver/device/pico_led_masa/state  # cihaz uyguladigi durumu buraya yazar; skill bunu bekler.
                                                  # Satiri silersen eski davranis: onay beklenmez
+  saat:
+    # Yaver Saat (masa saati, Pi Zero 2 W) - kendi servisini calistiran kart.
+    # type: board -> device_command araci. LLM sadece asagidaki ADLANDIRILMIS
+    # komutlardan birini secer; kart sonucu istek id'siyle ack_topic'e yazar.
+    type: board
+    label: "masadaki Yaver Saat"
+    topic: yaver/device/saat/command        # {"id", "command", "params"}
+    ack_topic: yaver/device/saat/result     # {"id", "command", "status": ok|error, "data"|"message"}
+    online_topic: yaver/device/saat/online  # retained "1"/"0" (LWT) - "0" ise komut hic gonderilmez
+    ack_timeout_sec: 5
+    commands:
+      bluetooth_pairing:
+        label: "Bluetooth eşleşme modunu 2 dakikalığına açar (telefonu saatin hoparlörüne bağlamak için)"
+        params: {sec: 120}
 
 commands:
   # run_command araci: onceden tanimli, ADLANDIRILMIS komutlar. LLM sadece adi
