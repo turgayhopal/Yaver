@@ -109,7 +109,9 @@ Skill altyapısı:
 
 Mevcut araçlar: `led_control`, `get_datetime`, `calculate`, `set_timer`,
 `cancel_timer`, `remember`, `forget`, `run_command` (komut varsa),
-`device_command` (`type: board` kart varsa - Yaver Saat),
+`device_command` (`type: board` kart varsa - Yaver Saat), kartın
+config'deki `tools`'undan üretilen araçlar (`saat_alarm`, `saat_setting`,
+`saat_music` - `make_board_tool()`),
 `delegate_task` (açıksa - `skills.delegate`, `claude -p` çalıştırır).
 
 brain'in bir soruyu işleyişi (`ask()`): LLM ya cevap verir (cümle cümle
@@ -189,6 +191,22 @@ bölümünde tanımlı — bkz. yukarıdaki genel cihaz kayıt defteri açıklam
 | `yaver/device/<cihaz>/command` | skills → kart (QoS1, retained değil) | `{"id": "...", "command": "bluetooth_pairing", "params": {...}}` - `type: board` kartlar (Yaver Saat), `device_command` aracı. Komutlar `config.yaml` → `devices.<cihaz>.commands`'ta ADLANDIRILMIŞ |
 | `yaver/device/<cihaz>/result` | kart → skills (QoS1, retained değil) | `{"id": aynı, "command": "...", "status": "ok\|error", "data": {...}}` ya da `"message"` - skills sadece kendi `id`'sini kabul eder (`parse_device_result()`); bilinmeyen komut → `error` |
 | `yaver/device/<cihaz>/online` | kart → herkes (retained, LWT) | `"1"` bağlanınca, LWT `"0"` - `"0"` ise `device_command` komutu hiç göndermez |
+| `yaver/device/<cihaz>/event` | kart → skills (QoS1, retained değil) | `{"event": "alarm_ringing", "id", "time", "label"}` / `{"event": "alarm_stopped", "id"}` - `devices.<cihaz>.announce`'ta olan olay brain'e bildirilir (LLM söyler); hepsi kaydedilir: kart bir işi kendisi yaptıysa (alarmı saatte durdurdular) `skills.board_event_window_sec` içinde gelen ikinci komutun "zaten yok" hatası hata sayılmaz (`ok_if_recent_event`) |
+
+Kart araçları kodda değil config'de (`devices.<cihaz>.tools`): her araç bir
+`action` enum'u + düz parametreler; her action bir kart komutuna ve
+gönderilecek parametre listesine eşlenir. 10 komut 10 araç olmasın diye
+gruplanır (4B model çok araçta şaşırıyor). Komut sözleşmesinin tek doğru
+kaynağı: yaver-saat repo `PROJE.md` "Komutlar".
+
+**Ölçüldü (2026-11-19, yerel 4B, 16 saat cümlesi):** tek `set` + serbest
+`days` ile model "yarın 8'e alarm" için bile `days: hergun` yazıyordu →
+tek seferlik (`set`, `date: yarin`) ve tekrarlayan (`set_repeating`, `days`
+enum) ayrı action; model `set`'e `days` verirse `switch_if_given` ile
+`set_repeating`'e geçilir. Sonra kurma/ayar/müzik durdur/eşleşme/liste
+doğru; **"alarmı durdur", "ertele", "sonraki şarkı"da model aracı çağırmadan
+"yapıyorum" diyor** (bilinen sorun 4). Alarm çalarken durdur/ertele'yi saat
+kendisi de (Vosk) anlıyor.
 
 ### Yaver Saat ses sözleşmesi (Faz 3-4, henüz kodlanmadı)
 
@@ -199,7 +217,7 @@ oradan çıkar. Plan (iki oturumda kullanıcıyla onaylandı, 2026-11-19):
 
 - Faz 0: PC zinciri evde gerçek mikrofon/hoparlörle test (bu bitmeden ear/mouth ses yoluna dokunulmaz)
 - Faz 1: Mosquitto LAN + kimlik doğrulama + ACL (aşağıda)
-- Faz 2: saat sadece istemci - yüz (`yaver/status`'u okur) + `device_command` **← yapıldı**
+- Faz 2: saat sadece istemci - yüz (`yaver/status`'u okur) + `device_command` + alarm/ayar/müzik araçları + alarm duyurusu (söz Faz 4'e kadar PC hoparlöründen) **← yapıldı**
 - Faz 3: saat mikrofonu ek ses kaynağı (cevap hâlâ PC hoparlöründen)
 - Faz 4: cevap hedefe göre saat hoparlöründen + `played` onayı
 - Faz 5: iki kaynak birlikte + hakemlik
@@ -225,7 +243,7 @@ Kurallar:
 - Saat PC'ye modemde DHCP rezervasyonuyla sabitlenmiş IP ile bağlanır (Pico gibi).
 - Saat MQTT kullanıcısı `saat`, ACL: yazma `yaver/audio/saat/mic`,
   `yaver/audio/saat/played`, `yaver/device/saat/online`,
-  `yaver/device/saat/result`; okuma `yaver/audio/saat/speaker`,
+  `yaver/device/saat/result`, `yaver/device/saat/event`; okuma `yaver/audio/saat/speaker`,
   `yaver/device/saat/command`, `yaver/status`, `yaver/control`,
   `yaver/reply/text`. Kimlik doğrulamasız broker'da mikrofon akışı =
   ağdaki herkes odayı dinler ve sahte sesle komut verir: Faz 1 ZORUNLU.
@@ -545,6 +563,10 @@ etkisini sürdürür. Cevaplar tuhaflaşırsa önce bu dosyayı sil.
    Yaver konuştuktan sonraki birkaç saniyede odadaki her cümle ona gider.
 4. **Küçük yerel model (4B) sınırlı.** Türkçe sohbette ve araç seçiminde
    Claude'un belirgin gerisinde; bazen aracı çağırmadan "yaptım" diyebilir.
+   **Ölçüldü (2026-11-19): geçmiş BOŞKEN ilk soruda hiç araç çağırmıyor**
+   ("saat kaç?" → uydurma saat); tek bir sohbet turu varken aynı soruda
+   doğru araç. `history.json` silindikten sonraki ilk soru bundan etkilenir.
+   Henüz çözülmedi.
 5. **Mosquitto hâlâ kimlik doğrulamasız ve sadece 127.0.0.1'de** (bkz.
    yukarıda "Mosquitto kimlik doğrulama"). Pico bağlanamaz.
 

@@ -207,6 +207,68 @@ class DeviceCommandTest(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(client.sent, [])
 
+    def sent_request(self, client):
+        import json as _json
+        return _json.loads(client.sent[0][1])
+
+    def test_alarm_set_sends_only_its_params(self):
+        ctx, client = self.make_ctx()
+        result = skills.run_skill(ctx, "saat_alarm", {"action": "set", "time": "07:00", "date": "yarin",
+                                                      "days": "haftaici", "id": "a1", "min": None})
+        self.assertEqual(result["status"], "ok", result)
+        request = self.sent_request(client)
+        self.assertEqual(request["command"], "alarm_set")
+        # set + days -> set_repeating'e gecer (switch_if_given), date/id/min gitmez
+        self.assertEqual(request["params"], {"time": "07:00", "days": "haftaici"})
+        self.assertEqual(result["data"]["action"], "set_repeating")
+
+    def test_one_time_alarm_keeps_date(self):
+        ctx, client = self.make_ctx()
+        skills.run_skill(ctx, "saat_alarm", {"action": "set", "time": "08:00", "date": "yarin"})
+        self.assertEqual(self.sent_request(client)["params"], {"time": "08:00", "date": "yarin"})
+
+    def test_music_action_goes_to_params(self):
+        ctx, client = self.make_ctx()
+        skills.run_skill(ctx, "saat_music", {"action": "next"})
+        request = self.sent_request(client)
+        self.assertEqual((request["command"], request["params"]), ("music", {"action": "next"}))
+
+    def test_unknown_action_rejected(self):
+        ctx, client = self.make_ctx()
+        result = skills.run_skill(ctx, "saat_alarm", {"action": "patlat"})
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(client.sent, [])
+
+    def test_double_stop_is_not_an_error(self):
+        # Saat alarmi kendisi durdurdu (alarm_stopped olayi), sonra Yaver'in
+        # stop komutu "calan alarm yok" hatasi aldi -> hata sayilmaz.
+        skills.recent_events.clear()
+        ctx, _ = self.make_ctx(status="error")
+        self.assertEqual(skills.run_skill(ctx, "saat_alarm", {"action": "stop"})["status"], "error")
+        skills.handle_board_event(ctx, "saat", '{"event": "alarm_stopped", "id": "a1"}')
+        result = skills.run_skill(ctx, "saat_alarm", {"action": "stop"})
+        self.assertEqual(result["status"], "ok", result)
+        skills.recent_events.clear()
+
+    def test_ringing_event_is_announced(self):
+        import json as _json
+        notes = []
+
+        class Client:
+            def publish(self, topic, payload, retain=False, qos=0):
+                notes.append((topic, _json.loads(payload)))
+        ctx = skills.SkillContext(Client())
+        skills.handle_board_event(ctx, "saat", '{"event": "alarm_ringing", "id": "a1", "time": "07:00"}')
+        skills.handle_board_event(ctx, "saat", '{"event": "alarm_stopped", "id": "a1"}')  # duyurulmaz
+        skills.handle_board_event(ctx, "saat", "bozuk")
+        skills.handle_board_event(ctx, "saat", '{"event": 5}')
+        self.assertEqual(len(notes), 1)
+        topic, packet = notes[0]
+        self.assertEqual(topic, skills.SK["topic_event"])
+        self.assertIn("07:00", packet["data"]["message"])
+        self.assertNotIn("{label}", packet["data"]["message"])
+        skills.recent_events.clear()
+
 
 class ClaudeConversionTest(unittest.TestCase):
     def test_tool_turn_becomes_tool_use_and_merged_results(self):

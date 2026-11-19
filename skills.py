@@ -462,7 +462,18 @@ if DELEGATE.get("enabled"):
 # config.yaml -> devices, type: board - kendi servisini calistiran kart
 # (orn. Yaver Saat). LLM cihazi ve config'de ADLANDIRILMIS komutu secer;
 # kart sonucu istek id'siyle geri yazar (bkz. CLAUDE.md "Cihaz konulari").
+# Iki tur arac uretilir, ikisi de kod degil config'den:
+#   - device_command: parametresiz (sabit params'li) komutlar (`commands`)
+#   - kartin `tools` girdileri: bir "action" + duz parametreler; her action
+#     bir kart komutuna eslenir (orn. saat_alarm: set -> alarm_set). 10
+#     komutu 10 arac yapmak kucuk modeli sasirtir, bu yuzden gruplanir.
 BOARDS = devices_by_type("board")
+
+# Kartin event konusundan son gorulen olaylar: (cihaz, olay) -> zaman.
+# Ayni isi kart da kendisi yapmis olabilir (orn. alarmi saatte Vosk
+# durdurdu) - o zaman ikinci komutun "zaten yok" hatasi hata degildir.
+recent_events = {}
+recent_events_lock = threading.Lock()
 
 
 def parse_device_result(payload, request_id):
@@ -477,7 +488,108 @@ def parse_device_result(payload, request_id):
     return packet
 
 
-if BOARDS:
+def send_board_command(ctx, device, command, params, timeout=None):
+    """Karta komut gonderir, id'si eslesen sonucu bekler. Basarida kartin
+    data'sini dondurur, hata/zaman asiminda RuntimeError."""
+    cfg = BOARDS[device]
+    online_topic = cfg.get("online_topic")
+    if online_topic and ctx.last.get(online_topic) == "0":
+        raise RuntimeError("cihaz şu an kapalı ya da ağa bağlı değil, komut GÖNDERİLMEDİ")
+    request_id = uuid.uuid4().hex[:12]
+    payload = json.dumps({"id": request_id, "command": command, "params": params or {}},
+                         ensure_ascii=False)
+    reply = ctx.publish_and_wait(
+        cfg["topic"], payload, cfg["ack_topic"],
+        timeout or cfg.get("ack_timeout_sec", SK["device_ack_timeout_sec"]),
+        match=lambda raw: parse_device_result(raw, request_id) is not None, qos=1)
+    if reply is None:
+        raise RuntimeError("cihaz cevap vermedi (kapalı ya da ağa bağlı değil olabilir), işlem YAPILAMADI")
+    result = parse_device_result(reply, request_id)
+    if result.get("status") != "ok":
+        raise RuntimeError(f"cihaz hata bildirdi: {result.get('message') or result.get('data')}")
+    return result.get("data")
+
+
+def event_seen_recently(device, event, within_sec):
+    with recent_events_lock:
+        seen = recent_events.get((device, event))
+    return seen is not None and time.time() - seen <= within_sec
+
+
+def board_action_params(action_cfg, args, omit=None):
+    """LLM'in verdigi duz parametrelerden bu action'in komutuna gidecekleri
+    secer. Bos olanlar ve `omit`'teki "yok" anlamli degerler (orn. days: tek
+    - karta hic gonderilmez) atilir. Saf, test edilir."""
+    omit = omit or {}
+    return {name: args[name] for name in action_cfg.get("params") or []
+            if args.get(name) not in (None, "") and args.get(name) not in (omit.get(name) or [])}
+
+
+def make_board_tool(device, tool_name, tool_cfg):
+    """config'deki bir kart aracini (orn. saat_alarm) SKILLS'e kaydeder."""
+    actions = tool_cfg["actions"]
+    properties = {"action": {"type": "string", "enum": list(actions),
+                             "description": "; ".join(f"{a} = {c['label']}" for a, c in actions.items())}}
+    properties.update(tool_cfg.get("parameters") or {})
+
+    def run(ctx, action, **args):
+        action_cfg = actions.get(action)
+        if action_cfg is None:
+            raise ValueError(f"bilinmeyen işlem: {action}")
+        # Model dogru parametreyi verip yanlis action secebiliyor (orn. "her gun"
+        # icin set + days) - parametre hangi action'i gosteriyorsa ona gec.
+        for param, other in (action_cfg.get("switch_if_given") or {}).items():
+            if args.get(param) not in (None, "") and other in actions:
+                action, action_cfg = other, actions[other]
+                break
+        # action'in kendisi de komuta gidebilir (orn. music {action: next})
+        params = board_action_params(action_cfg, {**args, "action": action}, tool_cfg.get("omit"))
+        try:
+            data = send_board_command(ctx, device, action_cfg["command"], params,
+                                      action_cfg.get("timeout_sec"))
+        except RuntimeError:
+            already = action_cfg.get("ok_if_recent_event")
+            if already and event_seen_recently(device, already, SK["board_event_window_sec"]):
+                return {"action": action, "status": "zaten yapılmıştı (cihaz kendisi halletti)"}
+            raise
+        return {"action": action, "data": data}
+
+    skill(name=tool_name, description=tool_cfg["description"],
+          parameters={"type": "object", "properties": properties, "required": ["action"]},
+          confirm=any(c.get("confirm") for c in actions.values()))(run)
+
+
+def handle_board_event(ctx, device, raw):
+    """Kartin event konusundan gelen olay: kaydet, `announce` listesindeyse
+    brain'e bildir (LLM kullaniciya soyler). Saf degil ama ag thread'inde
+    kisa: sadece bir publish."""
+    try:
+        packet = json.loads(raw)
+    except (TypeError, ValueError):
+        return
+    if not isinstance(packet, dict) or not isinstance(packet.get("event"), str):
+        return
+    event = packet["event"]
+    with recent_events_lock:
+        recent_events[(device, event)] = time.time()
+    template = (BOARDS[device].get("announce") or {}).get(event)
+    if template:
+        fields = {k: ("" if v is None else v) for k, v in packet.items()}
+        message = template.format_map(_Blank(fields))
+        ctx.notify(f"{device}_{event}", {"message": message})
+
+
+class _Blank(dict):
+    """format_map icin: eksik alan bos metin olur (kart bir alani gondermezse)."""
+    def __missing__(self, key):
+        return ""
+
+
+def board_event_topics():
+    return {cfg["event_topic"]: name for name, cfg in BOARDS.items() if cfg.get("event_topic")}
+
+
+if any(cfg.get("commands") for cfg in BOARDS.values()):
     BOARD_COMMANDS = sorted({name for cfg in BOARDS.values() for name in (cfg.get("commands") or {})})
 
     @skill(
@@ -506,22 +618,13 @@ if BOARDS:
         cmd = (cfg.get("commands") or {}).get(command)
         if cmd is None:
             raise ValueError(f"{device} bu komutu bilmiyor: {command}")
-        online_topic = cfg.get("online_topic")
-        if online_topic and ctx.last.get(online_topic) == "0":
-            raise RuntimeError("cihaz şu an kapalı ya da ağa bağlı değil, komut GÖNDERİLMEDİ")
-        request_id = uuid.uuid4().hex[:12]
-        payload = json.dumps({"id": request_id, "command": command,
-                              "params": cmd.get("params") or {}}, ensure_ascii=False)
-        reply = ctx.publish_and_wait(
-            cfg["topic"], payload, cfg["ack_topic"],
-            cmd.get("timeout_sec", cfg.get("ack_timeout_sec", SK["device_ack_timeout_sec"])),
-            match=lambda raw: parse_device_result(raw, request_id) is not None, qos=1)
-        if reply is None:
-            raise RuntimeError("cihaz cevap vermedi (kapalı ya da ağa bağlı değil olabilir), işlem YAPILAMADI")
-        result = parse_device_result(reply, request_id)
-        if result.get("status") != "ok":
-            raise RuntimeError(f"cihaz hata bildirdi: {result.get('message') or result.get('data')}")
-        return {"device": device, "command": command, "data": result.get("data")}
+        data = send_board_command(ctx, device, command, cmd.get("params"), cmd.get("timeout_sec"))
+        return {"device": device, "command": command, "data": data}
+
+
+for _device, _cfg in BOARDS.items():
+    for _tool_name, _tool_cfg in (_cfg.get("tools") or {}).items():
+        make_board_tool(_device, _tool_name, _tool_cfg)
 
 
 # --------------------------------------------------------------------------- MQTT
@@ -577,6 +680,7 @@ def main():
     ctx = SkillContext(client)
     pool = ThreadPoolExecutor(max_workers=SK["workers"])
     acks = ack_topics()
+    events = board_event_topics()
     # Son vasiyet (LWT): skills kapanirsa (Ctrl+C, cokme, main.py'nin
     # terminate'i - hepsinde baglanti DISCONNECT'siz kopar) broker bos bir
     # retained yuk yayinlayip arac listesini siler. brain bunu gorunce
@@ -594,6 +698,9 @@ def main():
 
     @guard
     def on_message(client_, userdata, msg):
+        if msg.topic in events:
+            handle_board_event(ctx, events[msg.topic], msg.payload.decode("utf-8", errors="replace"))
+            return
         if msg.topic in acks:
             ctx.deliver(msg.topic, msg.payload.decode("utf-8", errors="replace").strip())
             return
@@ -612,7 +719,7 @@ def main():
 
     def on_connect(client_, userdata, flags, rc, properties=None):
         client_.subscribe(SK["topic_request"])
-        for topic in acks:
+        for topic in acks | set(events):
             client_.subscribe(topic, qos=1)
         publish_tool_list(client_)
         publish_memory(ctx)

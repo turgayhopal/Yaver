@@ -6,7 +6,7 @@ Türkçe konuşan, uyandırma kelimesiyle tetiklenen modüler bir sesli asistan.
 
 - Mikrofonu dinler, cümlede "yaver" geçince konuşmayı metne çevirir (Whisper)
 - Bir LLM'e sorar — yerel (Ollama, llama.cpp ya da OpenAI uyumlu başka bir sunucu) ya da Claude API — cevabı üretirken aynı anda cümle cümle seslendirir (Piper)
-- Araç (skill) çağırır, bir soruda birden fazla adımda: cihaz kontrolü (Pico W LED, cihazdan onay bekleyerek), saat/tarih, hesap, zamanlayıcı, hafızaya yazma, ağdaki kartlara tanımlı komut (örn. Yaver Saat'te Bluetooth eşleşme), `config.yaml`'da tanımlı komutlar (örn. ssh ile uzaktaki bir karta), isteğe bağlı olarak karmaşık işleri Claude Code'a devretme
+- Araç (skill) çağırır, bir soruda birden fazla adımda: cihaz kontrolü (Pico W LED, cihazdan onay bekleyerek), saat/tarih, hesap, zamanlayıcı, hafızaya yazma, Yaver Saat (alarm, ayarlar, müzik, Bluetooth eşleşme; alarm çalınca sesli selam), `config.yaml`'da tanımlı komutlar (örn. ssh ile uzaktaki bir karta), isteğe bağlı olarak karmaşık işleri Claude Code'a devretme
 - Riskli işlemlerden önce sesli onay ister ("Onaylıyor musun?" → "evet")
 - Konuşurken "Yaver dur" denince susar; cevap verdikten sonra birkaç saniye "yaver" demeden devam edilebilir
 - Masaüstünün köşesinde küçük, saydam bir widget ile o an ne yaptığını (dinliyor / düşünüyor / konuşuyor) gösterir

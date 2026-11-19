@@ -44,6 +44,8 @@ skills:
   list_wait_sec: 2.0                   # brain acilista LLM'i isitmadan once arac listesini en fazla bu kadar bekler
   workers: 4                           # araclar bu kadar thread'de paralel calisir (MQTT ag thread'i hic bloklanmaz)
   device_ack_timeout_sec: 2.0          # cihaz (orn. Pico) "yaptim" onayini en fazla bu kadar bekle, yoksa hata
+  board_event_window_sec: 15           # kart bir isi kendisi yaptiysa (orn. alarmi saat durdurdu) bu sure icinde
+                                       # gelen ikinci komutun "zaten yok" hatasi hata sayilmaz (ok_if_recent_event)
   command_timeout_sec: 20              # run_command: bir komutun varsayilan en uzun suresi
   output_max_chars: 1500               # komut/ajan ciktisi LLM'e en fazla bu kadar verilir
   timer_max_sec: 86400                 # en uzun zamanlayici (1 gun)
@@ -86,11 +88,59 @@ devices:
     topic: yaver/device/saat/command        # {"id", "command", "params"}
     ack_topic: yaver/device/saat/result     # {"id", "command", "status": ok|error, "data"|"message"}
     online_topic: yaver/device/saat/online  # retained "1"/"0" (LWT) - "0" ise komut hic gonderilmez
+    event_topic: yaver/device/saat/event    # {"event": "alarm_ringing"|"alarm_stopped", ...}
     ack_timeout_sec: 5
-    commands:
+    # Komut sozlesmesinin tek dogru kaynagi: yaver-saat repo PROJE.md "Komutlar".
+    commands:                               # parametresiz komutlar -> device_command araci
       bluetooth_pairing:
         label: "Bluetooth eşleşme modunu 2 dakikalığına açar (telefonu saatin hoparlörüne bağlamak için)"
         params: {sec: 120}
+    tools:
+      # Her biri ayri bir LLM araci: "action" + duz parametreler. action'in
+      # `params` listesi, LLM'in verdigi parametrelerden hangilerinin o
+      # komuta gidecegini secer.
+      saat_alarm:
+        description: "Masadaki Yaver Saat'in alarmları: kurma, listeleme, silme, çalan alarmı susturma ve erteleme. Alarmla ilgili HER istekte bunu çağır (alarm saatte çalar, Yaver kapalıyken de). Kısa süreli geri sayım için bunu değil set_timer'ı kullan."
+        actions:
+          set: {command: alarm_set, label: "tek seferlik alarm kur (bugün, yarın, cuma...)", params: [time, date, label], switch_if_given: {days: set_repeating}}
+          set_repeating: {command: alarm_set, label: "TEKRARLAYAN alarm kur, sadece kullanıcı her gün / hafta içi / hafta sonu dediyse", params: [time, days, label]}
+          list: {command: alarm_list, label: "kurulu alarmları getir"}
+          delete: {command: alarm_delete, label: "alarm sil (id ya da all)", params: [id]}
+          stop: {command: alarm_stop, label: "çalan alarmı sustur", ok_if_recent_event: alarm_stopped}
+          snooze: {command: alarm_snooze, label: "çalan alarmı ertele", params: [min]}
+        parameters:
+          time: {type: string, description: "set ve set_repeating için alarm saati, 24 saat HH:MM (örn. akşam 10 = 22:00, sabah 7 = 07:00)"}
+          days:                       # kucuk model tek bir "set"te days'i "yarin"a bile "hergun" diye
+            type: string              # dolduruyordu - tekrar ayri bir action (olculdu, 2026-11-19)
+            enum: [hergun, haftaici, haftasonu]
+            description: "set_repeating için: hergun, haftaici (Pazartesi-Cuma), haftasonu (Cumartesi-Pazar)"
+          label: {type: string, description: "set için alarmın kısa adı (isteğe bağlı)"}
+          date: {type: string, description: "set için alarmın günü: bugun, yarin, obur gun, bir gün adı (cuma) ya da YYYY-MM-DD. Verilmezse bugün, saat geçtiyse yarın"}
+          id: {type: string, description: "delete için alarm kimliği (list'ten, örn. a3) ya da hepsi için all"}
+          min: {type: integer, description: "snooze için dakika (varsayılan 10)"}
+      saat_setting:
+        description: "Masadaki Yaver Saat'in ayarları: arka plan rengi, parlaklık, ses seviyesi, gece saatleri, saat göstergesi."
+        actions:
+          set: {command: setting_set, label: "bir ayarı değiştir", params: [name, value]}
+          get: {command: setting_get, label: "tüm ayarları getir"}
+          reset: {command: setting_reset, label: "ayarı varsayılana döndür (name yoksa hepsi)", params: [name]}
+        parameters:
+          name:
+            type: string
+            enum: [background_color, brightness_day, brightness_night, night_start, night_end, volume, show_clock]
+            description: "background_color = gündüz arka plan rengi (Türkçe renk adı ya da #rrggbb); brightness_day = gündüz parlaklığı 5-100; brightness_night = gece parlaklığı 1-100; night_start/night_end = gece modu başlangıç/bitiş HH:MM; volume = ses seviyesi 0-100; show_clock = saati göster true/false"
+          value: {type: string, description: "set için yeni değer (örn. sarı, 70, 22:30, true)"}
+      saat_music:
+        description: "Saate Bluetooth ile bağlı telefondaki müziği kontrol eder."
+        actions:
+          play: {command: music, label: "çal / devam et", params: [action]}
+          pause: {command: music, label: "durdur", params: [action]}
+          next: {command: music, label: "sonraki şarkı", params: [action]}
+          previous: {command: music, label: "önceki şarkı", params: [action]}
+    announce:
+      # Kartin olayi -> LLM'e verilen bildirim ({alan} = olaydaki alan).
+      # Burada olmayan olaylar sadece kaydedilir (ok_if_recent_event icin).
+      alarm_ringing: "Masadaki saatin {time} alarmı çalıyor (adı: {label}). Kullanıcıya günün saatine uygun kısa bir selam ver ve saati söyle, tek cümle."
 
 commands:
   # run_command araci: onceden tanimli, ADLANDIRILMIS komutlar. LLM sadece adi
