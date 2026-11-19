@@ -95,6 +95,9 @@ devices:
       bluetooth_pairing:
         label: "Bluetooth eşleşme modunu 2 dakikalığına açar (telefonu saatin hoparlörüne bağlamak için)"
         params: {sec: 120}
+        # Telefon bagliyken saat reddeder: "zaten bagli: <telefon>" -> once onu ayirmak gerekir
+      bluetooth_pairing_stop:
+        label: "açık olan Bluetooth eşleşme modunu kapatır"
     tools:
       # Her biri ayri bir LLM araci: "action" + duz parametreler. action'in
       # `params` listesi, LLM'in verdigi parametrelerden hangilerinin o
